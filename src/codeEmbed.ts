@@ -3,9 +3,6 @@ import CodeFilesPlugin from "./main";
 import { mountCodeEditor } from "./mountCodeEditor";
 import { isSymbolCapableExtension, parseCodeSubpath, SymbolRange } from "./symbolResolver";
 
-const MIN_EMBED_HEIGHT = 80;
-const MAX_EMBED_HEIGHT = 500;
-
 /**
  * Registers a code-file embed creator for every extension the plugin manages,
  * so ![[file.cs]] / ![[file.rs#someFn]] render as read-only Monaco editors
@@ -63,30 +60,33 @@ class CodeFileEmbed extends Component {
 			);
 		}
 
-		const headerEl = this.containerEl.createDiv({ cls: "vscode-editor-code-embed-header" });
-		const titleText = symbol
-			? `${this.file.name}#${symbol}${occurrence > 1 ? `#${occurrence}` : ""}`
-			: this.file.name;
-		const titleEl = headerEl.createEl("a", {
-			cls: "vscode-editor-code-embed-title",
-			text: titleText,
-		});
-		titleEl.addEventListener("click", (evt) => {
-			evt.preventDefault();
-			this.plugin.app.workspace.openLinkText(this.ctx.linktext, this.ctx.sourcePath);
-		});
-		if (symbol && !symbolRange) {
-			headerEl.createSpan({
-				cls: "vscode-editor-code-embed-warning",
-				text: isSymbolCapableExtension(this.file.extension)
-					? ` — function "${symbol}" not found, showing whole file`
-					: " — function links are only supported for .cs and .rs",
+		if (this.plugin.settings.showEmbedHeader) {
+			const headerEl = this.containerEl.createDiv({ cls: "vscode-editor-code-embed-header" });
+			const titleText = symbol
+				? `${this.file.name}#${symbol}${occurrence > 1 ? `#${occurrence}` : ""}`
+				: this.file.name;
+			const titleEl = headerEl.createEl("a", {
+				cls: "vscode-editor-code-embed-title",
+				text: titleText,
 			});
+			titleEl.addEventListener("click", (evt) => {
+				evt.preventDefault();
+				this.plugin.app.workspace.openLinkText(this.ctx.linktext, this.ctx.sourcePath);
+			});
+			if (symbol && !symbolRange) {
+				headerEl.createSpan({
+					cls: "vscode-editor-code-embed-warning",
+					text: isSymbolCapableExtension(this.file.extension)
+						? ` — function "${symbol}" not found, showing whole file`
+						: " — function links are only supported for .cs and .rs",
+				});
+			}
 		}
 
 		const lines = (symbolRange ? symbolRange.text : content).split("\n");
 		const lineHeight = this.plugin.settings.fontSize * 1.5;
-		const height = Math.min(MAX_EMBED_HEIGHT, Math.max(MIN_EMBED_HEIGHT, lines.length * lineHeight + 10));
+		const maxHeight = this.getMaxHeightOverride() ?? this.plugin.settings.embedMaxHeight;
+		const height = Math.min(maxHeight, Math.max(this.plugin.settings.embedMinHeight, lines.length * lineHeight + 10));
 		const startLine = symbolRange ? symbolRange.startLine : 1;
 
 		const editorEl = this.containerEl.createDiv({ cls: "vscode-editor-code-embed-editor" });
@@ -102,10 +102,28 @@ class CodeFileEmbed extends Component {
 			{
 				readOnly: true,
 				scrollBeyondLastLine: false,
-				lineNumbers: (n: number) => String(startLine + n - 1),
+				// Only supply a custom renderer when line numbers are wanted — a function here
+				// always renders numbers regardless of the "off" the settings-driven default
+				// (genEditorSettings) would otherwise produce, so it must not be set unconditionally.
+				lineNumbers: this.plugin.settings.lineNumbers
+					? (n: number) => String(startLine + n - 1)
+					: "off",
 				renderLineHighlight: "none",
 			}
 		);
+	}
+
+	/**
+	 * Reads a per-embed max-height override from `![[file.cs|500]]`. Obsidian parses the
+	 * `|500` alias using the same convention as image sizing (`![[img.png|500]]`) and sets it
+	 * as a `width` attribute on the embed container before the creator runs — there's no
+	 * dedicated "height" alias syntax to hook into, so we repurpose that attribute here.
+	 */
+	private getMaxHeightOverride(): number | null {
+		const raw = this.containerEl.getAttribute("width");
+		if (!raw) return null;
+		const value = Number(raw);
+		return Number.isFinite(value) && value > 0 ? value : null;
 	}
 
 	onunload() {

@@ -11,6 +11,9 @@ export interface EditorSettings {
 	fontSize: number;
 	fontFamily: string;
 	fontLigatures: boolean;
+	embedMaxHeight: number;
+	embedMinHeight: number;
+	showEmbedHeader: boolean;
 }
 
 export const DEFAULT_SETTINGS: EditorSettings = {
@@ -25,6 +28,9 @@ export const DEFAULT_SETTINGS: EditorSettings = {
 	fontSize: 14,
 	fontFamily: "'Cascadia Code', 'Fira Code', Consolas, 'Courier New', monospace",
 	fontLigatures: true,
+	embedMaxHeight: 500,
+	embedMinHeight: 0,
+	showEmbedHeader: true,
 }
 
 
