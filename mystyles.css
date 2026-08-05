@@ -43,3 +43,21 @@
 .vscode-editor-code-embed-editor{
     width: 100%;
 }
+
+/* Canvas file node: the box has a fixed height, so the editor fills it and Monaco
+   does the scrolling itself instead of the embed growing to the length of the file. */
+.vscode-editor-code-embed.vscode-editor-code-embed-fill{
+    display: flex;
+    flex-direction: column;
+}
+
+.vscode-editor-code-embed-fill > .vscode-editor-code-embed-editor{
+    flex: 1 1 0;
+    min-height: 0;
+}
+
+.vscode-editor-function-suggest-line{
+    color: var(--text-muted);
+    margin-left: 8px;
+    font-size: var(--font-ui-smaller);
+}

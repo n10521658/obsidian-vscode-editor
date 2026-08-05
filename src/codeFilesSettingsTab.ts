@@ -129,44 +129,6 @@ export class CodeFilesSettingsTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
-		let embedMaxHeightText: HTMLDivElement;
-		new Setting(containerEl)
-			.setName(t('EMBED_MAX_HEIGHT'))
-			.setDesc(t('EMBED_MAX_HEIGHT_DESC'))
-			.addSlider(slider => slider
-				.setLimits(100, 1500, 50)
-				.setValue(this.plugin.settings.embedMaxHeight)
-				.onChange(async (value) => {
-					embedMaxHeightText.innerText = " " + value.toString();
-					this.plugin.settings.embedMaxHeight = value;
-					await this.plugin.saveSettings();
-				}))
-			.settingEl.createDiv('', (el) => {
-				embedMaxHeightText = el;
-				el.style.minWidth = "3.5em";
-				el.style.textAlign = "right";
-				el.innerText = " " + this.plugin.settings.embedMaxHeight.toString();
-			});
-
-		let embedMinHeightText: HTMLDivElement;
-		new Setting(containerEl)
-			.setName(t('EMBED_MIN_HEIGHT'))
-			.setDesc(t('EMBED_MIN_HEIGHT_DESC'))
-			.addSlider(slider => slider
-				.setLimits(0, 500, 10)
-				.setValue(this.plugin.settings.embedMinHeight)
-				.onChange(async (value) => {
-					embedMinHeightText.innerText = " " + value.toString();
-					this.plugin.settings.embedMinHeight = value;
-					await this.plugin.saveSettings();
-				}))
-			.settingEl.createDiv('', (el) => {
-				embedMinHeightText = el;
-				el.style.minWidth = "3.5em";
-				el.style.textAlign = "right";
-				el.innerText = " " + this.plugin.settings.embedMinHeight.toString();
-			});
-
 		new Setting(containerEl)
 			.setName(t('EMBED_HEADER'))
 			.setDesc(t('EMBED_HEADER_DESC'))

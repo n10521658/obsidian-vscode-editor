@@ -13,6 +13,13 @@ export interface SymbolRange {
 	text: string;
 }
 
+export interface SymbolInfo {
+	name: string;
+	startLine: number; // 1-based
+	endLine: number;   // 1-based, inclusive
+	occurrence: number; // 1-based index among same-name functions in document order
+}
+
 const LANGUAGE_BY_EXTENSION: Record<string, { wasm: string; functionTypes: string[] }> = {
 	cs: { wasm: "tree-sitter-c_sharp.wasm", functionTypes: ["method_declaration", "constructor_declaration", "local_function_statement"] },
 	rs: { wasm: "tree-sitter-rust.wasm", functionTypes: ["function_item"] },
@@ -143,10 +150,52 @@ export class SymbolResolver {
 		}
 	}
 
-	private collectFunctionNodes(node: SyntaxNode, functionTypes: string[], name: string, out: SyntaxNode[]): void {
+	/**
+	 * Lists every function in the file in document order, with a 1-based
+	 * occurrence index distinguishing overloads / same-name functions.
+	 */
+	async listSymbols(content: string, extension: string): Promise<SymbolInfo[]> {
+		const langSpec = LANGUAGE_BY_EXTENSION[extension];
+		if (!langSpec) return [];
+		const language = await this.loadLanguage(extension);
+		if (!language) return [];
+
+		const parser = new Parser();
+		try {
+			parser.setLanguage(language);
+			const tree = parser.parse(content);
+			if (!tree) return [];
+			const nodes: SyntaxNode[] = [];
+			this.collectFunctionNodes(tree.rootNode, langSpec.functionTypes, null, nodes);
+
+			const seen = new Map<string, number>();
+			const out: SymbolInfo[] = [];
+			for (const node of nodes) {
+				const nameNode = node.childForFieldName("name") ?? this.lastIdentifierChild(node);
+				if (!nameNode) continue;
+				const name = nameNode.text;
+				const occurrence = (seen.get(name) ?? 0) + 1;
+				seen.set(name, occurrence);
+				out.push({
+					name,
+					startLine: node.startPosition.row + 1,
+					endLine: node.endPosition.row + 1,
+					occurrence,
+				});
+			}
+			return out;
+		} catch (e) {
+			console.error("vscode-editor: tree-sitter parse failed", e);
+			return [];
+		} finally {
+			parser.delete();
+		}
+	}
+
+	private collectFunctionNodes(node: SyntaxNode, functionTypes: string[], name: string | null, out: SyntaxNode[]): void {
 		if (functionTypes.includes(node.type)) {
 			const nameNode = node.childForFieldName("name") ?? this.lastIdentifierChild(node);
-			if (nameNode && nameNode.text === name) {
+			if (nameNode && (name === null || nameNode.text === name)) {
 				out.push(node);
 			}
 		}

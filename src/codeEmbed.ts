@@ -37,7 +37,9 @@ class CodeFileEmbed extends Component {
 	private file: TFile;
 	private subpath: string;
 	private containerEl: HTMLElement;
+	private editorEl: HTMLElement | null = null;
 	private mounted: mountCodeEditor | null = null;
+	private classObserver: MutationObserver | null = null;
 
 	constructor(plugin: CodeFilesPlugin, ctx: any, file: TFile, subpath: string) {
 		super();
@@ -85,12 +87,14 @@ class CodeFileEmbed extends Component {
 
 		const lines = (symbolRange ? symbolRange.text : content).split("\n");
 		const lineHeight = this.plugin.settings.fontSize * 1.5;
-		const maxHeight = this.getMaxHeightOverride() ?? this.plugin.settings.embedMaxHeight;
-		const height = Math.min(maxHeight, Math.max(this.plugin.settings.embedMinHeight, lines.length * lineHeight + 10));
+		// Only a seed height so Monaco has a sized container to lay out into; the real
+		// height is taken from the editor itself in syncHeight() as soon as it exists.
+		const seedHeight = lines.length * lineHeight + 10;
 		const startLine = symbolRange ? symbolRange.startLine : 1;
 
 		const editorEl = this.containerEl.createDiv({ cls: "vscode-editor-code-embed-editor" });
-		editorEl.style.height = `${height}px`;
+		this.editorEl = editorEl;
+		editorEl.style.height = `${seedHeight}px`;
 
 		this.mounted = new mountCodeEditor(
 			editorEl,
@@ -102,6 +106,10 @@ class CodeFileEmbed extends Component {
 			{
 				readOnly: true,
 				scrollBeyondLastLine: false,
+				// Pin Monaco's line height so it doesn't vary by platform (left unset, Monaco
+				// derives its own ratio from fontSize), keeping the seed height close to the
+				// final one and avoiding a visible resize jump on load.
+				lineHeight,
 				// Only supply a custom renderer when line numbers are wanted — a function here
 				// always renders numbers regardless of the "off" the settings-driven default
 				// (genEditorSettings) would otherwise produce, so it must not be set unconditionally.
@@ -111,6 +119,58 @@ class CodeFileEmbed extends Component {
 				renderLineHighlight: "none",
 			}
 		);
+
+		this.applyLayout();
+		// The canvas hands the embed creator a bare, detached container and only stamps
+		// `canvas-node-content` onto it later, so the first applyLayout() above cannot yet
+		// tell a canvas node from a note. Watch for the class rather than guessing at the
+		// delay — neither a timer nor requestAnimationFrame lands reliably after it (the
+		// canvas' rAF loop is parked outright while the Obsidian window is hidden).
+		this.classObserver = new MutationObserver(() => this.applyLayout());
+		this.classObserver.observe(this.containerEl, {
+			attributes: true,
+			attributeFilter: ["class"],
+		});
+		// Word wrap makes the content height depend on the container width, so it changes
+		// whenever a canvas node is resized or the note pane narrows.
+		this.mounted.monacoEditor.onDidContentSizeChange(() => this.applyLayout());
+	}
+
+	/**
+	 * Picks how the editor is sized:
+	 *
+	 * - **Canvas file node** — a fixed-size box whose content element Obsidian keeps at
+	 *   `overflow: hidden`. The editor fills the node and Monaco scrolls itself, exactly like
+	 *   the full-page code view.
+	 * - **Anywhere else** — the note is what scrolls, so the editor has to be exactly as tall
+	 *   as Monaco's content. A line count × line height estimate is not good enough: word wrap
+	 *   turns one source line into several, and every pixel of the difference is content that
+	 *   nothing can scroll to. Take the height from the editor itself instead.
+	 */
+	private applyLayout() {
+		if (!this.mounted || !this.editorEl) return;
+
+		// `canvas-node-content` marks a canvas *file* node specifically — an `![[file.cs]]`
+		// written inside a canvas text node is an ordinary embed in a scrolling markdown
+		// view, so it wants the grow-to-content path below.
+		if (this.containerEl.hasClass("canvas-node-content")) {
+			// Settled — the container's classes tell us nothing more from here on.
+			this.classObserver?.disconnect();
+			this.containerEl.addClass("vscode-editor-code-embed-fill");
+			this.editorEl.style.removeProperty("height");
+			return;
+		}
+
+		const contentHeight = this.mounted.monacoEditor.getContentHeight();
+		if (contentHeight <= 0) return;
+		const maxHeightOverride = this.getMaxHeightOverride();
+		const height = maxHeightOverride
+			? Math.min(maxHeightOverride, contentHeight)
+			: contentHeight;
+		// Guard against a resize feedback loop: a height change can shift the container's
+		// width (scrollbar appearing/disappearing), which re-wraps and fires this again.
+		if (Math.abs(this.editorEl.clientHeight - height) < 1) return;
+		this.editorEl.style.height = `${height}px`;
 	}
 
 	/**
@@ -127,10 +187,13 @@ class CodeFileEmbed extends Component {
 	}
 
 	onunload() {
+		this.classObserver?.disconnect();
+		this.classObserver = null;
 		if (this.mounted) {
 			this.mounted.monacoEditor.dispose();
 			this.mounted = null;
 		}
+		this.editorEl = null;
 		this.containerEl.empty();
 		super.onunload();
 	}

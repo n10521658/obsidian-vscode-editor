@@ -10,6 +10,8 @@ import { FenceEditContext } from "./fenceEditContext";
 import { mountCodeEditor } from "./mountCodeEditor";
 import { registerCodeEmbedCreators } from "./codeEmbed";
 import { SymbolResolver, parseCodeSubpath, isSymbolCapableExtension } from "./symbolResolver";
+import { CodeFunctionSuggest } from "./functionSuggest";
+import { setupCanvasNarrowing, setupCanvasAddCodeFile } from "./canvasNarrow";
 
 declare module "obsidian" {
 	interface Workspace {
@@ -44,6 +46,22 @@ export default class CodeFilesPlugin extends Plugin {
 
 		this.symbolResolver = new SymbolResolver(this.app, this.manifest.dir ?? "");
 		registerCodeEmbedCreators(this);
+		setupCanvasNarrowing(this);
+		setupCanvasAddCodeFile(this);
+
+		// Function suggestions for [[file.cs#… — moved to the front of the
+		// internal suggest list so it wins over core's heading suggest (which
+		// would otherwise swallow the trigger for non-markdown files).
+		const functionSuggest = new CodeFunctionSuggest(this);
+		this.registerEditorSuggest(functionSuggest);
+		const suggests = (this.app.workspace as any).editorSuggest?.suggests;
+		if (Array.isArray(suggests)) {
+			const i = suggests.indexOf(functionSuggest);
+			if (i > 0) {
+				suggests.splice(i, 1);
+				suggests.unshift(functionSuggest);
+			}
+		}
 
 		this.registerView(viewType, leaf => new CodeEditorView(leaf, this));
 
