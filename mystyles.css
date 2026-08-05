@@ -15,3 +15,31 @@
 .setting_ext textarea{
     height: 6rem !important;
 }
+
+.vscode-editor-code-embed{
+    display: block;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    margin: 4px 0;
+    overflow: hidden;
+}
+
+.vscode-editor-code-embed-header{
+    padding: 4px 10px;
+    background-color: var(--background-secondary);
+    border-bottom: 1px solid var(--background-modifier-border);
+    font-size: var(--font-ui-smaller);
+}
+
+.vscode-editor-code-embed-title{
+    color: var(--text-accent);
+    cursor: pointer;
+}
+
+.vscode-editor-code-embed-warning{
+    color: var(--text-warning);
+}
+
+.vscode-editor-code-embed-editor{
+    width: 100%;
+}

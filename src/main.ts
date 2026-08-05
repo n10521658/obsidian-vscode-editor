@@ -8,6 +8,8 @@ import { t } from 'src/lang/helpers';
 import { FenceEditModal } from "./fenceEditModal";
 import { FenceEditContext } from "./fenceEditContext";
 import { mountCodeEditor } from "./mountCodeEditor";
+import { registerCodeEmbedCreators } from "./codeEmbed";
+import { SymbolResolver, parseCodeSubpath, isSymbolCapableExtension } from "./symbolResolver";
 
 declare module "obsidian" {
 	interface Workspace {
@@ -25,6 +27,8 @@ export default class CodeFilesPlugin extends Plugin {
 
 	observer: MutationObserver;
 
+	symbolResolver: SymbolResolver;
+
 	public hover: {
 		linkText: string;
 		sourcePath: string;
@@ -37,6 +41,9 @@ export default class CodeFilesPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+
+		this.symbolResolver = new SymbolResolver(this.app, this.manifest.dir ?? "");
+		registerCodeEmbedCreators(this);
 
 		this.registerView(viewType, leaf => new CodeEditorView(leaf, this));
 
@@ -99,12 +106,20 @@ export default class CodeFilesPlugin extends Plugin {
 			if (this.hover.linkText === null) return;
 			//@ts-ignore
 			if (mutation[0].addedNodes[0].className !== "popover hover-popover") return;
-			const file = this.app.metadataCache.getFirstLinkpathDest(this.hover.linkText, this.hover.sourcePath);
+			const { linkpath, symbol, occurrence } = parseCodeSubpath(this.hover.linkText);
+			const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, this.hover.sourcePath);
 			if (!file) return;
 			// check file.extension in this.settings.extensions array
 			let valid = this.settings.extensions.includes(file.extension);
 			if (valid === false) return;
-			const fileContent = await this.app.vault.read(file);
+			let fileContent = await this.app.vault.read(file);
+
+			if (symbol && isSymbolCapableExtension(file.extension)) {
+				const symbolRange = await this.symbolResolver.findSymbol(fileContent, file.extension, symbol, occurrence);
+				if (symbolRange) {
+					fileContent = symbolRange.text;
+				}
+			}
 
 			const node: Node = mutation[0].addedNodes[0];
 			const contentEl = createDiv();
