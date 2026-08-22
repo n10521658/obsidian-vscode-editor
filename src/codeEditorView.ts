@@ -41,8 +41,8 @@ export class CodeEditorView extends TextFileView {
 		// monaco.editor.setModelLanguage(model, this.getLanguage());
 		await super.onLoadFile(file);
 
-		// [[file.cs#SomeFunction]] links carry a subpath in ephemeral state —
-		// jump to the function once the file is loaded.
+		// [[file.cs#SomeSymbol]] links carry a subpath in ephemeral state —
+		// jump to the symbol once the file is loaded.
 		const ephemeralState: any = this.leaf.getEphemeralState();
 		if (ephemeralState?.subpath) {
 			this.pendingSubpath = ephemeralState.subpath;
@@ -66,7 +66,8 @@ export class CodeEditorView extends TextFileView {
 		if (!symbol) return;
 
 		const symbolRange = await this.plugin.symbolResolver.findSymbol(
-			this.monacoEditor.getValue(), extension, symbol, occurrence
+			this.monacoEditor.getValue(), extension, symbol, occurrence,
+			this.plugin.settings.linkableSymbolKinds
 		);
 		if (!symbolRange) return;
 

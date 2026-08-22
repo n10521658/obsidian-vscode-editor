@@ -58,7 +58,7 @@ class CodeFileEmbed extends Component {
 		let symbolRange: SymbolRange | null = null;
 		if (symbol && isSymbolCapableExtension(this.file.extension)) {
 			symbolRange = await this.plugin.symbolResolver.findSymbol(
-				content, this.file.extension, symbol, occurrence
+				content, this.file.extension, symbol, occurrence, this.plugin.settings.linkableSymbolKinds
 			);
 		}
 
@@ -79,8 +79,8 @@ class CodeFileEmbed extends Component {
 				headerEl.createSpan({
 					cls: "vscode-editor-code-embed-warning",
 					text: isSymbolCapableExtension(this.file.extension)
-						? ` — function "${symbol}" not found, showing whole file`
-						: " — function links are only supported for .cs and .rs",
+						? ` — symbol "${symbol}" not found, showing whole file`
+						: " — symbol links are only supported for .cs and .rs",
 				});
 			}
 		}

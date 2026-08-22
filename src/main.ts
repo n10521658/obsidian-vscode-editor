@@ -11,7 +11,8 @@ import { mountCodeEditor } from "./mountCodeEditor";
 import { registerCodeEmbedCreators } from "./codeEmbed";
 import { SymbolResolver, parseCodeSubpath, isSymbolCapableExtension } from "./symbolResolver";
 import { CodeFunctionSuggest } from "./functionSuggest";
-import { setupCanvasNarrowing, setupCanvasAddCodeFile } from "./canvasNarrow";
+import { setupCanvasNarrowing, setupCanvasAddCodeFile, setupCanvasCardMenuButton } from "./canvasNarrow";
+import { FlowchartCommands, setupFlowchartMenus } from "./flowchartMenu";
 
 declare module "obsidian" {
 	interface Workspace {
@@ -31,6 +32,8 @@ export default class CodeFilesPlugin extends Plugin {
 
 	symbolResolver: SymbolResolver;
 
+	flowchart: FlowchartCommands;
+
 	public hover: {
 		linkText: string;
 		sourcePath: string;
@@ -48,8 +51,10 @@ export default class CodeFilesPlugin extends Plugin {
 		registerCodeEmbedCreators(this);
 		setupCanvasNarrowing(this);
 		setupCanvasAddCodeFile(this);
+		setupCanvasCardMenuButton(this);
+		this.flowchart = setupFlowchartMenus(this);
 
-		// Function suggestions for [[file.cs#… — moved to the front of the
+		// Symbol suggestions for [[file.cs#… — moved to the front of the
 		// internal suggest list so it wins over core's heading suggest (which
 		// would otherwise swallow the trigger for non-markdown files).
 		const functionSuggest = new CodeFunctionSuggest(this);
@@ -133,7 +138,9 @@ export default class CodeFilesPlugin extends Plugin {
 			let fileContent = await this.app.vault.read(file);
 
 			if (symbol && isSymbolCapableExtension(file.extension)) {
-				const symbolRange = await this.symbolResolver.findSymbol(fileContent, file.extension, symbol, occurrence);
+				const symbolRange = await this.symbolResolver.findSymbol(
+					fileContent, file.extension, symbol, occurrence, this.settings.linkableSymbolKinds
+				);
 				if (symbolRange) {
 					fileContent = symbolRange.text;
 				}

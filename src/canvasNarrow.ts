@@ -1,13 +1,13 @@
-import { App, Menu, Notice, SuggestModal, TFile, prepareFuzzySearch } from "obsidian";
+import { App, Menu, Notice, SuggestModal, TFile, prepareFuzzySearch, setIcon, setTooltip } from "obsidian";
 import CodeFilesPlugin from "./main";
 import { isSymbolCapableExtension, SymbolInfo } from "./symbolResolver";
 
 /**
- * Adds "Narrow to function…" / "Show whole file" items to the canvas node's
+ * Adds "Narrow to symbol…" / "Show whole file" items to the canvas node's
  * context menu for symbol-capable code files.
  *
  * Canvas file nodes render through the plugin's embedRegistry creator
- * (CodeFileEmbed), which already understands `#function` subpaths — so
+ * (CodeFileEmbed), which already understands `#symbol` subpaths — so
  * narrowing is just a matter of setting `node.subpath` and re-rendering:
  *
  *   node.setData({ ...node.getData(), subpath: "#Fn" });
@@ -95,7 +95,10 @@ function maybeInjectAddCodeFile(plugin: CodeFilesPlugin, menu: Menu, evt: MouseE
 					canvas.createFileNode({
 						file,
 						pos,
-						size: { width: 560, height: 400 },
+						size: {
+							width: plugin.settings.canvasNodeWidth,
+							height: plugin.settings.canvasNodeHeight,
+						},
 					});
 					canvas.requestSave();
 				}).open();
@@ -120,6 +123,74 @@ function findCanvasForEvent(app: App, evt: MouseEvent): any {
 	return found;
 }
 
+/**
+ * Adds a "Drag to add code file" button to the canvas's native bottom card
+ * menu (the same floating control that offers Text/File/Link/Group), so code
+ * files don't require a right-click to add.
+ *
+ * `cardMenuEl`, `dragTempNode`, `createFileNode`, and `getViewportBBox` are
+ * native (undocumented) Canvas APIs — the button is a plain
+ * `div.canvas-card-menu-button.mod-draggable`, which Obsidian's own CSS
+ * already styles like the built-in buttons, so no custom styles are needed.
+ * There's no event for "a canvas view's card menu is ready", so the button is
+ * (re)applied on `active-leaf-change` and `layout-change`, which cover
+ * switching into a canvas tab, opening new panes/splits, and a canvas view
+ * rebuilding its card menu (e.g. on file swap). No prototype patching.
+ */
+export function setupCanvasCardMenuButton(plugin: CodeFilesPlugin) {
+	const applyToAll = () => {
+		for (const leaf of plugin.app.workspace.getLeavesOfType("canvas")) {
+			ensureAddCodeFileCardMenuButton(plugin, (leaf.view as any)?.canvas);
+		}
+	};
+
+	applyToAll(); // canvases already open when the plugin loads
+	plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", applyToAll));
+	plugin.registerEvent(plugin.app.workspace.on("layout-change", applyToAll));
+}
+
+const CARD_MENU_BUTTON_ID = "vscode-editor-add-code-file";
+
+function ensureAddCodeFileCardMenuButton(plugin: CodeFilesPlugin, canvas: any) {
+	if (!canvas?.cardMenuEl) return;
+	canvas.cardMenuEl.querySelector(`#${CARD_MENU_BUTTON_ID}`)?.remove();
+	canvas.cardMenuEl.appendChild(createAddCodeFileCardMenuButton(plugin, canvas));
+}
+
+function createAddCodeFileCardMenuButton(plugin: CodeFilesPlugin, canvas: any): HTMLElement {
+	const el = document.createElement("div");
+	el.id = CARD_MENU_BUTTON_ID;
+	el.classList.add("canvas-card-menu-button", "mod-draggable");
+	setIcon(el, "file-code");
+	setTooltip(el, "Drag to add code file", { placement: "top" });
+
+	const nodeSize = () => ({
+		width: plugin.settings.canvasNodeWidth,
+		height: plugin.settings.canvasNodeHeight,
+	});
+
+	const place = (pos: { x: number; y: number }) => {
+		canvas.deselectAll();
+		new CodeFileSuggestModal(plugin, (file) => {
+			canvas.createFileNode({ file, pos, size: nodeSize() });
+			canvas.requestSave();
+		}).open();
+	};
+
+	el.addEventListener("click", () => place(getViewportCenterPos(canvas, nodeSize())));
+	el.addEventListener("pointerdown", (e) => canvas.dragTempNode(e, nodeSize(), place));
+
+	return el;
+}
+
+function getViewportCenterPos(canvas: any, size: { width: number; height: number }) {
+	const b = canvas.getViewportBBox();
+	return {
+		x: (b.minX + b.maxX) / 2 - size.width / 2,
+		y: (b.minY + b.maxY) / 2 - size.height / 2,
+	};
+}
+
 function addNarrowMenuItems(plugin: CodeFilesPlugin, menu: Menu, node: any) {
 	const file = node.file;
 	if (!file || !isSymbolCapableExtension(file.extension)) return;
@@ -127,16 +198,18 @@ function addNarrowMenuItems(plugin: CodeFilesPlugin, menu: Menu, node: any) {
 
 	menu.addItem((item) =>
 		item
-			.setTitle("Narrow to function…")
+			.setTitle("Narrow to symbol…")
 			.setIcon("crosshair")
 			.onClick(async () => {
 				const content = await plugin.app.vault.cachedRead(file);
-				const symbols = await plugin.symbolResolver.listSymbols(content, file.extension);
+				const symbols = await plugin.symbolResolver.listSymbols(
+					content, file.extension, plugin.settings.linkableSymbolKinds
+				);
 				if (symbols.length === 0) {
-					new Notice(`vscode-editor: no functions found in ${file.name}`);
+					new Notice(`vscode-editor: no symbols found in ${file.name}`);
 					return;
 				}
-				new FunctionSuggestModal(plugin.app, symbols, (symbol) => {
+				new SymbolSuggestModal(plugin.app, symbols, (symbol) => {
 					const subpath = symbol.occurrence > 1
 						? `#${symbol.name}#${symbol.occurrence}`
 						: `#${symbol.name}`;
@@ -167,7 +240,7 @@ function applySubpath(node: any, subpath: string | null) {
 	node.canvas.requestSave();
 }
 
-function findCanvasNode(app: App, nodeEl: HTMLElement): any {
+export function findCanvasNode(app: App, nodeEl: HTMLElement): any {
 	let found: any = null;
 	app.workspace.iterateAllLeaves((leaf) => {
 		if (found) return;
@@ -217,7 +290,7 @@ class CodeFileSuggestModal extends SuggestModal<TFile> {
 	}
 }
 
-class FunctionSuggestModal extends SuggestModal<SymbolInfo> {
+class SymbolSuggestModal extends SuggestModal<SymbolInfo> {
 	private symbols: SymbolInfo[];
 	private onChoose: (symbol: SymbolInfo) => void;
 
@@ -225,7 +298,7 @@ class FunctionSuggestModal extends SuggestModal<SymbolInfo> {
 		super(app);
 		this.symbols = symbols;
 		this.onChoose = onChoose;
-		this.setPlaceholder("Narrow to function…");
+		this.setPlaceholder("Narrow to symbol…");
 	}
 
 	getSuggestions(query: string): SymbolInfo[] {
@@ -241,7 +314,7 @@ class FunctionSuggestModal extends SuggestModal<SymbolInfo> {
 		el.createSpan({ text: this.getItemText(item) });
 		el.createSpan({
 			cls: "vscode-editor-function-suggest-line",
-			text: `:${item.startLine}`,
+			text: `${item.kind !== "function" ? `${item.kind} ` : ""}:${item.startLine}`,
 		});
 	}
 

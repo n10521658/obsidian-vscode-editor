@@ -11,7 +11,8 @@ import CodeFilesPlugin from "./main";
 import { isSymbolCapableExtension, SymbolInfo } from "./symbolResolver";
 
 /**
- * Pops up a function list when typing `#` inside a wikilink/embed that points
+ * Pops up a symbol list (functions, variables, enums, … per the linkable-symbol
+ * settings) when typing `#` inside a wikilink/embed that points
  * at a symbol-capable code file (`[[LocalPlayer.cs#…`), mirroring Obsidian's
  * native `#heading` suggestions for markdown files.
  *
@@ -22,8 +23,8 @@ import { isSymbolCapableExtension, SymbolInfo } from "./symbolResolver";
  */
 export class CodeFunctionSuggest extends EditorSuggest<SymbolInfo> {
 	private plugin: CodeFilesPlugin;
-	// Cache parsed symbols per file path+mtime so each keystroke doesn't re-parse.
-	private cache = new Map<string, { mtime: number; symbols: SymbolInfo[] }>();
+	// Cache parsed symbols per file path+mtime+kinds so each keystroke doesn't re-parse.
+	private cache = new Map<string, { mtime: number; kindsKey: string; symbols: SymbolInfo[] }>();
 
 	constructor(plugin: CodeFilesPlugin) {
 		super(plugin.app);
@@ -54,13 +55,15 @@ export class CodeFunctionSuggest extends EditorSuggest<SymbolInfo> {
 		if (!target) return [];
 
 		let symbols: SymbolInfo[];
+		const kinds = this.plugin.settings.linkableSymbolKinds;
+		const kindsKey = kinds.join(",");
 		const cached = this.cache.get(target.path);
-		if (cached && cached.mtime === target.stat.mtime) {
+		if (cached && cached.mtime === target.stat.mtime && cached.kindsKey === kindsKey) {
 			symbols = cached.symbols;
 		} else {
 			const content = await this.plugin.app.vault.cachedRead(target);
-			symbols = await this.plugin.symbolResolver.listSymbols(content, target.extension);
-			this.cache.set(target.path, { mtime: target.stat.mtime, symbols });
+			symbols = await this.plugin.symbolResolver.listSymbols(content, target.extension, kinds);
+			this.cache.set(target.path, { mtime: target.stat.mtime, kindsKey, symbols });
 		}
 
 		if (!ctx.query) return symbols;
@@ -72,7 +75,7 @@ export class CodeFunctionSuggest extends EditorSuggest<SymbolInfo> {
 		el.createSpan({ text: item.name });
 		el.createSpan({
 			cls: "vscode-editor-function-suggest-line",
-			text: `:${item.startLine}${item.occurrence > 1 ? ` #${item.occurrence}` : ""}`,
+			text: `${item.kind !== "function" ? `${item.kind} ` : ""}:${item.startLine}${item.occurrence > 1 ? ` #${item.occurrence}` : ""}`,
 		});
 	}
 
