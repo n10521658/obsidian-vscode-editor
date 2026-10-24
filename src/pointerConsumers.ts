@@ -10,14 +10,19 @@ import { SymbolInfo } from "./symbolResolver";
  * (consumer -> target, with a verb and the symbol/accessor involved).
  *
  * Edge sources (all built by buildFlowchartModel):
- * - `crossDetectedEdges` — Rust cross-file mentions (`uses`), `ctx.db` table
- *   accesses (`reads`/`writes`), C# table-name strings (`subscribes to`).
+ * - `crossDetectedEdges` — Rust cross-file mentions (`uses`), module-side
+ *   `ctx.db` table accesses (`reads`/`writes`), Rust SDK consumers (`reads`
+ *   the client cache, `registers callbacks on` tables and reducers,
+ *   `subscribes to`, `calls reducer`), C# table-name strings
+ *   (`subscribes to`).
  * - `detectedEdges` — C# `Reducers.X(...)` (`calls reducer`, resolved through
  *   `reducerIndex`) and `.Db.X` reads (`reads table`, via `accessorIndex`).
  *   Bare-name AutoEdges are same-file only and never cross the folder
  *   boundary, so they are skipped.
  * - `fileEdges` — `.tscn` wiring: attached scripts, instanced scenes, and
  *   `TableName` binds.
+ * - `importEdges` — module-level `use` (`imports`), `mod x;` (`declares
+ *   module`) and `include!` splices (`includes`), as a fallback.
  *
  * Scenes get one hop of transitivity: a `.tscn` that attaches a script also
  * inherits that script's folder-targeting usages, marked `via` the script —
@@ -35,7 +40,7 @@ export interface PointerUsage {
 	target: TFile;
 	/** The targeted symbol inside the target file; null = whole-file target (scene/instance edges, symbol-less files). */
 	targetSym: SymbolInfo | null;
-	/** `calls reducer` / `reads table` / `reads` / `writes` / `subscribes to` / `uses` / `binds` / `attaches script` / `instances scene`. */
+	/** `calls reducer` / `reads table` / `reads` / `writes` / `subscribes to` / `registers callbacks on` / `uses` / `binds` / `attaches script` / `instances scene` / `includes`. */
 	verb: string;
 	/** The reducer fn, accessor, or symbol name involved. */
 	name: string;
@@ -64,6 +69,15 @@ function findOwnerSymbol(symbols: SymbolInfo[], name: string, occurrence?: numbe
 	}
 	return symbols.find((s) => s.name === name) ?? null;
 }
+
+/** Pointer verb for each `crossDetectedEdges` label; unlabeled mentions are `uses`. */
+const CROSS_EDGE_VERBS: Record<string, string> = {
+	read: "reads",
+	write: "writes",
+	subscribe: "subscribes to",
+	rpc: "calls reducer",
+	callback: "registers callbacks on",
+};
 
 /** Module name a file declares: `player/mod.rs` → `player`, `geo.rs` → `geo`. */
 function moduleNameOf(file: TFile): string {
@@ -102,14 +116,7 @@ export function collectPointerUsage(model: FlowchartModel, target: TFolder): Poi
 
 		for (const e of ff.crossDetectedEdges) {
 			if (!inTarget(e.toFile)) continue;
-			const verb =
-				e.label === "read"
-					? "reads"
-					: e.label === "write"
-						? "writes"
-						: e.label === "subscribe"
-							? "subscribes to"
-							: "uses";
+			const verb = (e.label && CROSS_EDGE_VERBS[e.label]) || "uses";
 			push({
 				consumer: ff.file,
 				consumerSym: findOwnerSymbol(ff.symbols, e.from, e.fromOccurrence),
@@ -174,10 +181,10 @@ export function collectPointerUsage(model: FlowchartModel, target: TFolder): Poi
 			});
 		}
 
-		// Module-level `use`/`pub use` of another file's symbol, and `mod x;`
-		// declarations (whole-file references, no owning symbol). Kept aside: a
-		// file that also mentions the symbol inside a declaration should read as
-		// one usage, not two.
+		// Module-level `use`/`pub use` of another file's symbol, `mod x;`
+		// declarations and `include!` splices (whole-file references, no owning
+		// symbol). Kept aside: a file that also mentions the symbol inside a
+		// declaration should read as one usage, not two.
 		for (const e of ff.importEdges) {
 			if (!inTarget(e.toFile)) continue;
 			const isModuleDecl = e.label === "declare module";
@@ -186,8 +193,8 @@ export function collectPointerUsage(model: FlowchartModel, target: TFolder): Poi
 				consumerSym: null,
 				target: e.toFile,
 				targetSym: e.toSym,
-				verb: isModuleDecl ? "declares module" : "imports",
-				name: isModuleDecl ? moduleNameOf(e.toFile) : e.toSym?.name ?? e.toFile.basename,
+				verb: isModuleDecl ? "declares module" : e.label === "include" ? "includes" : "imports",
+				name: isModuleDecl ? moduleNameOf(e.toFile) : e.toSym?.name ?? e.toFile.name,
 			});
 		}
 	}

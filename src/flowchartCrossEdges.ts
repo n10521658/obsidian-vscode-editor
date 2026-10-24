@@ -17,6 +17,13 @@ import { FlowchartFile, toSnakeCase } from "./flowchartModel";
  *   vault root above the crate still resolves `crate::…` imports) and expanded
  *   into an imported-name → target-symbol map. Glob imports expand to every
  *   edgeable symbol of the target file.
+ * - `include!("…")` splices (a SpacetimeDB framework file pasted into every
+ *   module crate) make the two files one namespace: the includer sees every
+ *   item of the included file as if glob-imported (and `use crate::x` /
+ *   `crate::x` reach them), and the included file's bare calls to functions
+ *   its includers define (module hooks) are edges to each includer's
+ *   function. The included file lives in every includer's crate, so its
+ *   tables count as local to each of them.
  * - A mention scan flags every `\bname\b` occurrence of an imported symbol
  *   inside a symbol's line range (calls, struct literals, `Type::assoc`,
  *   signature types all mention the name). Ownership is the innermost symbol
@@ -24,22 +31,50 @@ import { FlowchartFile, toSnakeCase } from "./flowchartModel";
  *   attribute/doc lines directly above a symbol count as that symbol (this is
  *   what catches `scheduled(tick_active_consumable_effects)` in a `#[table]`
  *   attribute, which sits above the struct's own line range).
- * - A `ctx.db.<accessor>(` scan maps SpacetimeDB table handles to the struct
- *   whose `#[table(accessor = <name>, ...)]` matches, via a vault-wide
- *   accessor index built from the scanned files. The index also covers
- *   `#[…::view(accessor = …)]` functions (client-visible read views) and both
- *   bare (`#[table(…)`) and qualified (`#[spacetimedb::table(…)`) attributes.
- *   Each match is labeled `write` when its statement writes
- *   (`.insert/.update/.delete/.try_insert/.upsert(`) and `read` otherwise.
+ * - A qualified-path scan resolves `crate::util::wrap(…)`,
+ *   `kg_intermod::InterModuleMessage::Ping` and `axial::Axial` (through a
+ *   `use kg_hex::axial;` module import): the longest module prefix that names
+ *   a scanned file, then the next segment as a symbol defined or re-exported
+ *   there.
+ * - A `.db.<accessor>()` scan maps SpacetimeDB table handles to the struct
+ *   whose `#[table(accessor = <name>, ...)]` matches. The receiver is any
+ *   expression (`ctx.db`, `conn.db`, `link.conn.db`) and the chain may be
+ *   split across lines the way rustfmt writes it (`ctx\n.db\n.player()`).
+ *   The index covers `#[…::view(accessor = …)]` functions too (client-visible
+ *   read views) and both bare (`#[table(…)`) and qualified
+ *   (`#[spacetimedb::table(…)`) attributes. Only known accessors match, so
+ *   unrelated `.db` fields produce nothing. What a match means depends on
+ *   the consuming crate:
+ *   - **Module side** (a crate that defines or includes tables, views or
+ *     reducers): the accessor resolves to the table in the consumer's own
+ *     crate first (two modules may define the same accessor), and the edge
+ *     is `write` when the method chain after the handle mutates
+ *     (`.insert(`/`.update(`/`.delete(`/… directly or through an index —
+ *     `ctx.db.player().identity().update(…)`), else `read`.
+ *   - **SDK consumer** (any other crate — game client, bots, relay): the
+ *     generated client cache. `.on_insert(`/`.on_update(`/`.on_delete(` row
+ *     callbacks are `callback` edges, anything else `read`.
+ * - Other SDK consumer patterns: typed subscription queries
+ *   (`global::regionQueryTableAccess::region(&q.from)`) are `subscribe` edges
+ *   to the table or view; `.reducers.<name>(` and `.reducers.<name>_then(`
+ *   calls are `rpc` edges to the reducer, `.reducers.on_<name>(` callbacks are
+ *   `callback` edges. A consumer talks to a database through generated
+ *   bindings, so when an accessor or reducer name exists in more than one
+ *   module crate the bindings-module qualifier picks it: `global::…` /
+ *   `region::DbConnection` in the owning function (else anywhere in the file,
+ *   when only one module is named) selects the module crate whose folder has
+ *   that name. Still-ambiguous sites yield no edge.
  *
- * Same-file targets are recorded only for the `ctx.db` scan (a table defined
- * in the using file is still a table access); same-file *mentions* stay with
- * the per-file detector. Variables are neither owners nor targets
- * (a `pub const` must not become an edge endpoint). Resolution limits:
- * qualified-path calls (`a::b::foo()`) and module-alias imports are not
- * tracked, a name exported by two glob imports resolves to the first import,
- * and two crates exporting the same module path collide first-wins. All of
- * these simply yield no edge when they fail to resolve.
+ * Same-file targets are recorded only for the table-handle scan (a table
+ * defined in the using file is still a table access); same-file *mentions*
+ * stay with the per-file detector. Variables are neither owners nor targets
+ * (a `pub const` must not become an edge endpoint). The table, reducer and
+ * qualified-path scans ignore `//` comments, the mention scan reads only the
+ * backticked names in them, and all scans ignore string contents.
+ * Resolution limits: a name exported by two glob imports resolves
+ * to the first import, and two crates exporting the same module path
+ * collide first-wins. These simply yield no edge (or the first edge) when
+ * they fail to resolve.
  *
  * Module-level imports are recorded separately on `FlowchartFile.importEdges`
  * (file-owned, like `.tscn` wiring — never drawn as flowchart edges). A
@@ -47,11 +82,25 @@ import { FlowchartFile, toSnakeCase } from "./flowchartModel";
  * any declaration is still a real reference: a GDExtension `lib.rs` registers
  * every class by re-exporting it, so without this the class's own module would
  * look unused. The pointer index renders these as "imports …" only when no
- * deeper symbol-level usage exists.
+ * deeper symbol-level usage exists. `include!` splices land there too
+ * (`label: "include"`).
  */
 
 /** Symbol kinds that may own or receive a cross-file edge (variables excluded). */
 export const CROSS_EDGE_KINDS: Set<SymbolKind> = new Set(["function", "struct", "enum", "class", "interface"]);
+
+/** Table-handle methods that change rows, directly or through an index. */
+const WRITE_METHODS = new Set([
+	"insert",
+	"try_insert",
+	"update",
+	"try_update",
+	"upsert",
+	"try_upsert",
+	"delete",
+	"try_delete",
+	"clear",
+]);
 
 /** A resolved cross-file reference: `from` (in the FlowchartFile's own file) mentions `toSym`. */
 export interface CrossSymbolEdge {
@@ -60,7 +109,10 @@ export interface CrossSymbolEdge {
 	fromOccurrence?: number;
 	toFile: TFile;
 	toSym: SymbolInfo;
-	/** `read` / `write` for `ctx.db` table accesses; unset for plain mentions. */
+	/**
+	 * `read` / `write` for module-side table accesses; `read` / `callback` /
+	 * `subscribe` / `rpc` for SDK consumers; unset for plain mentions.
+	 */
 	label?: string;
 }
 
@@ -81,6 +133,87 @@ function parenDelta(s: string): number {
 		else if (ch === ")") d--;
 	}
 	return d;
+}
+
+/** A line with its string literals emptied (quotes kept), so their contents can't match. */
+function scrubStrings(line: string): string {
+	return line.replace(/"([^"\\]|\\.)*"/g, '""');
+}
+
+/**
+ * A string-scrubbed line for the mention scan: the code before any `//`, plus
+ * only the backtick-quoted spans of the comment (`` /// Calls `send_message` ``
+ * names code; `/// Admin-only` is prose).
+ */
+function mentionText(line: string): string {
+	const cut = line.indexOf("//");
+	if (cut < 0) return line;
+	const quoted = line.slice(cut).match(/`[^`]*`/g) ?? [];
+	return `${line.slice(0, cut)} ${quoted.join(" ")}`;
+}
+
+/** Offset just past the `)` that closes the `(` at `open` (end of text when unbalanced). */
+function matchClose(code: string, open: number): number {
+	let depth = 0;
+	for (let i = open; i < code.length; i++) {
+		const ch = code[i];
+		if (ch === "(") depth++;
+		else if (ch === ")" && --depth === 0) return i + 1;
+	}
+	return code.length;
+}
+
+/**
+ * Method names chained from offset `j`: `.a().b(x)` → `["a", "b"]`. Arguments
+ * are skipped by paren balance and whitespace (newlines included) may sit
+ * around each `.`, so rustfmt's one-call-per-line chains read the same.
+ */
+function chainAfter(code: string, j: number): string[] {
+	const names: string[] = [];
+	const link = /\s*\.\s*(\w+)\s*(?:::\s*<[^>]*>\s*)?\(/y;
+	for (;;) {
+		link.lastIndex = j;
+		const m = link.exec(code);
+		if (!m) return names;
+		names.push(m[1]);
+		j = matchClose(code, link.lastIndex - 1);
+	}
+}
+
+/** Offsets where each line of `text` starts. */
+function lineStarts(text: string): number[] {
+	const out = [0];
+	for (let i = 0; i < text.length; i++) if (text[i] === "\n") out.push(i + 1);
+	return out;
+}
+
+/** 0-based row of `offset`, given `lineStarts(text)`. */
+function rowAt(starts: number[], offset: number): number {
+	let lo = 0;
+	let hi = starts.length - 1;
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (starts[mid] <= offset) lo = mid;
+		else hi = mid - 1;
+	}
+	return lo;
+}
+
+/** Vault path of `rel` resolved against the folder of `file` (`.`/`..` folded). */
+function resolveRelative(file: TFile, rel: string): string {
+	const segs = file.parent && file.parent.path !== "/" ? file.parent.path.split("/") : [];
+	for (const s of rel.replace(/\\/g, "/").split("/")) {
+		if (s === "" || s === ".") continue;
+		if (s === "..") segs.pop();
+		else segs.push(s);
+	}
+	return segs.join("/");
+}
+
+/** Folder name of a crate base (`server/modules/region/src` → `region`). */
+function crateNameOf(base: string): string {
+	const dir = base.endsWith("/src") ? base.slice(0, -"/src".length) : base;
+	return dir.split("/").pop() ?? dir;
 }
 
 /**
@@ -246,13 +379,30 @@ function innermostSymbol(symbols: SymbolInfo[], line: number): SymbolInfo | null
 	return best;
 }
 
+/** Candidates with duplicates (the same defining symbol reached twice) removed. */
+function distinctTargets(list: ImportTarget[]): ImportTarget[] {
+	const seen = new Set<string>();
+	return list.filter((t) => {
+		const key = `${t.ff.file.path}#${t.sym.name}#${t.sym.occurrence}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function pushTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+	const list = map.get(key);
+	if (list) list.push(value);
+	else map.set(key, [value]);
+}
+
 /**
  * Fills `crossDetectedEdges` of every Rust file in `files` (see the file
  * header for the heuristics) and returns the SpacetimeDB accessor index
- * (table/view accessor name → defining symbol) — the C# table detectors in
- * flowchartModel.ts resolve against it too. Runs after the per-file scan so
- * every file's symbols are known; re-reads file contents via the metadata
- * cache.
+ * (table/view accessor name → first defining symbol) — the C# table
+ * detectors in flowchartModel.ts resolve against it too. Runs after the
+ * per-file scan so every file's symbols (and `reducerFns`) are known;
+ * re-reads file contents via the metadata cache.
  */
 export async function detectCrossFileEdges(
 	app: App,
@@ -260,12 +410,31 @@ export async function detectCrossFileEdges(
 	files: FlowchartFile[],
 ): Promise<Map<string, ImportTarget>> {
 	const rsFiles = files.filter((ff) => ff.file.extension === "rs");
+	const byPath = new Map(rsFiles.map((ff) => [ff.file.path, ff]));
 
-	// Module path → file, for `use` resolution. Module paths are only unique
-	// per crate (`kg_editor/src/ui.rs` and `kg_gdext/src/ui/mod.rs` are both
-	// `ui`), so the index is keyed by the file's crate base too — otherwise the
-	// first crate scanned would swallow the other's `crate::…` imports.
-	const modIndex = new Map<string, FlowchartFile>();
+	// Read every Rust file once.
+	const linesByFile = new Map<FlowchartFile, string[]>();
+	for (const ff of rsFiles) linesByFile.set(ff, (await app.vault.cachedRead(ff.file)).split("\n"));
+
+	// `include!("…")` splices, resolved relative to the including file.
+	const includes = new Map<FlowchartFile, FlowchartFile[]>();
+	const includedBy = new Map<FlowchartFile, FlowchartFile[]>();
+	const reInclude = /\binclude!\s*\(\s*"([^"]+)"\s*\)/g;
+	for (const ff of rsFiles) {
+		for (const line of linesByFile.get(ff)!) {
+			if (/^\s*\/\//.test(line)) continue;
+			reInclude.lastIndex = 0;
+			let m: RegExpExecArray | null;
+			while ((m = reInclude.exec(line)) !== null) {
+				const target = byPath.get(resolveRelative(ff.file, m[1]));
+				if (!target || target === ff || includes.get(ff)?.includes(target)) continue;
+				pushTo(includes, ff, target);
+				pushTo(includedBy, target, ff);
+				ff.importEdges.push({ toFile: target.file, toSym: null, label: "include" });
+			}
+		}
+	}
+
 	const crateKeyCache = new Map<string, string>();
 	const crateKey = (file: TFile): string => {
 		let key = crateKeyCache.get(file.path);
@@ -275,14 +444,33 @@ export async function detectCrossFileEdges(
 		}
 		return key;
 	};
+	/** The crates a file's items live in: an included file lives in each includer's crate. */
+	const crateKeysOf = (ff: FlowchartFile): string[] => {
+		const by = includedBy.get(ff);
+		return by ? [...new Set(by.map((f) => crateKey(f.file)))] : [crateKey(ff.file)];
+	};
+	/** The module path `self`/`super` resolve against (an included file takes its first includer's). */
+	const selfModOf = (ff: FlowchartFile): string | null =>
+		modulePathFor(root, (includedBy.get(ff)?.[0] ?? ff).file);
+
+	// Module path → file, for `use` resolution. Module paths are only unique
+	// per crate (`kg_editor/src/ui.rs` and `kg_gdext/src/ui/mod.rs` are both
+	// `ui`), so the index is keyed by the file's crate base too — otherwise the
+	// first crate scanned would swallow the other's `crate::…` imports.
+	const modIndex = new Map<string, FlowchartFile>();
 	for (const ff of rsFiles) {
 		const mod = modulePathFor(root, ff.file);
 		const key = mod === null ? null : `${crateKey(ff.file)}|${mod}`;
 		if (key !== null && !modIndex.has(key)) modIndex.set(key, ff);
 	}
 	/** The file declaring the module at `mod` in the same crate as `from`. */
-	const lookupModule = (from: FlowchartFile, mod: string): FlowchartFile | undefined =>
-		modIndex.get(`${crateKey(from.file)}|${mod}`);
+	const lookupModule = (from: FlowchartFile, mod: string): FlowchartFile | undefined => {
+		for (const key of crateKeysOf(from)) {
+			const hit = modIndex.get(`${key}|${mod}`);
+			if (hit) return hit;
+		}
+		return undefined;
+	};
 
 	// Crate directory name → crate base, so an import of a SIBLING in-repo crate
 	// (`use kg_hex::axial::Axial;` inside kg_sim) resolves too. Without this a
@@ -293,8 +481,7 @@ export async function detectCrossFileEdges(
 	for (const ff of rsFiles) {
 		const base = crateKey(ff.file);
 		if (base === root.path) continue; // no Cargo.toml above this file
-		const dir = base.endsWith("/src") ? base.slice(0, -"/src".length) : base;
-		const name = dir.split("/").pop();
+		const name = crateNameOf(base);
 		if (name && !crateBases.has(name)) crateBases.set(name, base);
 	}
 	/** Same-crate first, then a sibling crate named by the path's first segment. */
@@ -313,20 +500,27 @@ export async function detectCrossFileEdges(
 		return modIndex.get(`${externalBase}|${mod.slice(cut + 2)}`);
 	};
 
-	// Read every Rust file once; build the SpacetimeDB accessor index
+	// Parse `use` statements; build the SpacetimeDB accessor index
 	// (`#[table(accessor = X)]` above a struct, `#[…::view(accessor = X)]`
-	// above a fn — both bare and `spacetimedb::`-qualified attributes) and
-	// stash the lines for later.
-	const linesByFile = new Map<FlowchartFile, string[]>();
+	// above a fn — both bare and `spacetimedb::`-qualified attributes) and the
+	// reducer index; note which crates are SpacetimeDB modules.
 	/** Each file's parsed `use` statements — also the re-export table (see findSymbolIn). */
 	const useImportsByFile = new Map<FlowchartFile, UseImport[]>();
 	const accessorIndex = new Map<string, ImportTarget>();
+	const accessorCandidates = new Map<string, ImportTarget[]>();
+	const reducerCandidates = new Map<string, ImportTarget[]>();
+	/** Crates that define (or include) tables, views or reducers. */
+	const moduleCrates = new Set<string>();
 	for (const ff of rsFiles) {
-		const lines = (await app.vault.cachedRead(ff.file)).split("\n");
-		linesByFile.set(ff, lines);
-		const ffMod = modulePathFor(root, ff.file);
+		const lines = linesByFile.get(ff)!;
+		const ffMod = selfModOf(ff);
 		if (ffMod !== null) useImportsByFile.set(ff, parseUseImports(lines.join("\n"), ffMod));
+		let isModuleFile = false;
 		for (const sym of ff.symbols) {
+			if (sym.kind === "function" && ff.reducerFns.has(sym.name)) {
+				pushTo(reducerCandidates, sym.name, { ff, sym });
+				isModuleFile = true;
+			}
 			if (sym.kind !== "struct" && sym.kind !== "function") continue;
 			const attr = attributeRowsAbove(lines, sym.startLine)
 				.map((row) => lines[row - 1])
@@ -337,19 +531,49 @@ export async function detectCrossFileEdges(
 			const m = /\baccessor\s*=\s*(\w+)/.exec(attr) ?? /\bname\s*=\s*(\w+)/.exec(attr);
 			const accessor = m ? m[1] : toSnakeCase(sym.name);
 			if (!accessorIndex.has(accessor)) accessorIndex.set(accessor, { ff, sym });
+			pushTo(accessorCandidates, accessor, { ff, sym });
+			isModuleFile = true;
 		}
+		if (isModuleFile) for (const key of crateKeysOf(ff)) moduleCrates.add(key);
 	}
+	const moduleCrateNames = new Set([...moduleCrates].map(crateNameOf));
+	const isModuleSide = (ff: FlowchartFile): boolean => crateKeysOf(ff).some((k) => moduleCrates.has(k));
+
+	/** Module-side resolution: candidates living in one of `from`'s crates, else the only candidate. */
+	const moduleTargets = (from: FlowchartFile, list: ImportTarget[] | undefined): ImportTarget[] => {
+		if (!list) return [];
+		const all = distinctTargets(list);
+		const keys = new Set(crateKeysOf(from));
+		const local = all.filter((t) => crateKeysOf(t.ff).some((k) => keys.has(k)));
+		if (local.length > 0) return local;
+		return all.length === 1 ? all : [];
+	};
+	/**
+	 * SDK-consumer resolution: the only candidate, else the one in the module
+	 * crate the bindings qualifier names. Null when still ambiguous.
+	 */
+	const sdkTarget = (list: ImportTarget[] | undefined, qualifier: string | null): ImportTarget | null => {
+		if (!list) return null;
+		const all = distinctTargets(list);
+		if (all.length === 1) return all[0];
+		if (!qualifier) return null;
+		return all.find((t) => crateKeysOf(t.ff).some((k) => crateNameOf(k) === qualifier)) ?? null;
+	};
 
 	/**
 	 * The defining symbol `name` reachable from module `target`: defined there,
-	 * or re-exported (`pub use small::SmallHex;`) and therefore defined in a
-	 * submodule — the idiom that makes `use kg_hex::{SmallHex, Torus};` work in
-	 * Rust, where the crate root only re-exports. Follows one chain up to 3
-	 * hops, cycle-guarded.
+	 * spliced in by an `include!`, or re-exported (`pub use small::SmallHex;`)
+	 * and therefore defined in a submodule — the idiom that makes
+	 * `use kg_hex::{SmallHex, Torus};` work in Rust, where the crate root only
+	 * re-exports. Follows one chain up to 3 hops, cycle-guarded.
 	 */
 	const findSymbolIn = (target: FlowchartFile, name: string, depth = 0): ImportTarget | null => {
 		const own = target.symbols.find((s) => s.name === name && CROSS_EDGE_KINDS.has(s.kind));
 		if (own) return { ff: target, sym: own };
+		for (const inc of includes.get(target) ?? []) {
+			const spliced = inc.symbols.find((s) => s.name === name && CROSS_EDGE_KINDS.has(s.kind));
+			if (spliced) return { ff: inc, sym: spliced };
+		}
 		if (depth >= 3) return null;
 		for (const imp of useImportsByFile.get(target) ?? []) {
 			if (imp.names === "*") {
@@ -369,7 +593,7 @@ export async function detectCrossFileEdges(
 		return null;
 	};
 
-	/** Every symbol a `use M::*;` brings in, following re-exports (cycle-guarded). */
+	/** Every symbol a `use M::*;` brings in, following includes and re-exports (cycle-guarded). */
 	const symbolsOfModule = (
 		target: FlowchartFile,
 		depth = 0,
@@ -377,9 +601,10 @@ export async function detectCrossFileEdges(
 	): ImportTarget[] => {
 		if (seen.has(target) || depth > 3) return [];
 		seen.add(target);
-		const out: ImportTarget[] = target.symbols
-			.filter((s) => CROSS_EDGE_KINDS.has(s.kind))
-			.map((sym) => ({ ff: target, sym }));
+		const out: ImportTarget[] = [];
+		for (const ff of [target, ...(includes.get(target) ?? [])]) {
+			for (const sym of ff.symbols) if (CROSS_EDGE_KINDS.has(sym.kind)) out.push({ ff, sym });
+		}
 		for (const imp of useImportsByFile.get(target) ?? []) {
 			const next = lookupUse(target, imp.mod);
 			if (!next || next === target) continue;
@@ -396,30 +621,37 @@ export async function detectCrossFileEdges(
 	};
 
 	for (const ff of rsFiles) {
-		const lines = linesByFile.get(ff);
-		const selfMod = modulePathFor(root, ff.file);
-		if (!lines || selfMod === null) continue;
+		const lines = linesByFile.get(ff)!;
+		const selfMod = selfModOf(ff);
+		if (selfMod === null) continue;
 
-		// Imported-name → target symbol map. Locally defined names shadow
+		// Imported-name → target symbols. Locally defined names shadow
 		// imports; between two imports the first one wins.
 		const localNames = new Set(ff.symbols.map((s) => s.name));
-		const imported = new Map<string, ImportTarget>();
+		const imported = new Map<string, ImportTarget[]>();
+		/** `use`-bound name → the module path it names (`use kg_hex::axial;` → `kg_hex::axial`). */
+		const useAliases = new Map<string, string>();
 		const importSeen = new Set<string>();
 		for (const imp of useImportsByFile.get(ff) ?? []) {
+			if (imp.names !== "*") {
+				for (const { name, alias } of imp.names) {
+					if (!useAliases.has(alias)) useAliases.set(alias, imp.mod ? `${imp.mod}::${name}` : name);
+				}
+			}
 			const target = lookupUse(ff, imp.mod);
 			if (!target) continue;
 			if (imp.names === "*") {
 				for (const found of symbolsOfModule(target)) {
 					const { sym } = found;
 					if (localNames.has(sym.name) || imported.has(sym.name)) continue;
-					imported.set(sym.name, found);
+					imported.set(sym.name, [found]);
 				}
 			} else {
 				for (const { name, alias } of imp.names) {
 					if (localNames.has(alias) || imported.has(alias)) continue;
 					const found = findSymbolIn(target, name);
 					if (!found) continue;
-					imported.set(alias, found);
+					imported.set(alias, [found]);
 					// Module-level `use`/`pub use` of another file's symbol is a
 					// real reference even when the name never appears inside a
 					// declaration (GDExtension `lib.rs` re-export hubs). Recorded
@@ -430,6 +662,13 @@ export async function detectCrossFileEdges(
 					importSeen.add(key);
 					ff.importEdges.push({ toFile: found.ff.file, toSym: found.sym, label: "import" });
 				}
+			}
+		}
+		// An includer sees every item of the files it splices in.
+		for (const inc of includes.get(ff) ?? []) {
+			for (const sym of inc.symbols) {
+				if (!CROSS_EDGE_KINDS.has(sym.kind) || localNames.has(sym.name) || imported.has(sym.name)) continue;
+				imported.set(sym.name, [{ ff: inc, sym }]);
 			}
 		}
 
@@ -462,7 +701,7 @@ export async function detectCrossFileEdges(
 		const seen = new Set<string>();
 		const pushEdge = (owner: SymbolInfo, target: ImportTarget, label?: string, allowSameFile = false) => {
 			if (!allowSameFile && target.ff === ff) return; // same-file mentions stay with the per-file detector
-			const key = `${owner.name}#${owner.occurrence}->${target.ff.file.path}#${target.sym.name}:${label ?? ""}`;
+			const key = `${owner.name}#${owner.occurrence}->${target.ff.file.path}#${target.sym.name}#${target.sym.occurrence}:${label ?? ""}`;
 			if (seen.has(key)) return;
 			seen.add(key);
 			ff.crossDetectedEdges.push({
@@ -477,8 +716,15 @@ export async function detectCrossFileEdges(
 			innermostSymbol(ff.symbols, row) ?? attrOwner.get(row) ?? null;
 
 		// Scans run on string-scrubbed lines so `format!("Enchantment ...")`
-		// and friends can't produce phantom mentions.
-		const scrubbed = lines.map((l) => l.replace(/"([^"\\]|\\.)*"/g, '""'));
+		// and friends can't produce phantom mentions. The mention scan keeps
+		// the backticked names in comments (doc lines above a symbol are owned
+		// by it); the code scans below drop comments and run over the joined
+		// text, offsets mapped back to rows, so chains split across lines
+		// still match.
+		const scrubbed = lines.map((l) => mentionText(scrubStrings(l)));
+		const codeLines = lines.map((l) => scrubStrings(l).replace(/\/\/.*$/, ""));
+		const code = codeLines.join("\n");
+		const starts = lineStarts(code);
 
 		// Mention scan: any occurrence of an imported name (calls, struct
 		// literals, `Type::assoc`, signature types) inside a symbol's range.
@@ -495,34 +741,147 @@ export async function detectCrossFileEdges(
 					if (m.index > 0 && line[m.index - 1] === ".") continue;
 					if (line.startsWith(":", m.index + m[1].length) && !line.startsWith("::", m.index + m[1].length)) continue;
 					const owner = ownerAt(row + 1);
-					if (owner) pushEdge(owner, imported.get(m[1])!);
+					if (owner) for (const t of imported.get(m[1])!) pushEdge(owner, t);
 				}
 			}
 		}
 
-		// SpacetimeDB table handles: `ctx.db.<accessor>(` → the accessor's
-		// struct (or view fn). Labeled `write` when the statement (match →
-		// next `;`, so multi-line rustfmt chains are covered) mutates, else
-		// `read`. Same-file tables are recorded here — the per-file detector
-		// only sees plain calls.
-		const reDb = /\bctx\.db\.(\w+)\s*\(/g;
-		const reWrite = /\.\s*(insert|update|delete|try_insert|upsert)\s*\(/;
-		for (let row = 0; row < scrubbed.length; row++) {
-			reDb.lastIndex = 0;
+		// Qualified paths: the longest module prefix that names a scanned file,
+		// then the next segment as a symbol defined or re-exported there. Heads
+		// that are local or imported names are the other scans' business.
+		const rePath = /(?<![\w:])\w+(?:\s*::\s*\w+)+/g;
+		for (let row = 0; row < codeLines.length; row++) {
+			const line = codeLines[row];
+			if (/^\s*(?:pub(?:\([^)]*\))?\s+)?use\b/.test(line)) continue;
+			rePath.lastIndex = 0;
 			let m: RegExpExecArray | null;
-			while ((m = reDb.exec(scrubbed[row])) !== null) {
-				const target = accessorIndex.get(m[1]);
-				if (!target) continue;
+			while ((m = rePath.exec(line)) !== null) {
+				const segs = m[0].split(/\s*::\s*/);
+				const head = segs[0];
+				if (head === "Self" || localNames.has(head) || imported.has(head)) continue;
 				const owner = ownerAt(row + 1);
 				if (!owner) continue;
-				let stmt = scrubbed[row].slice(m.index);
-				for (let r2 = row + 1; !stmt.includes(";") && r2 < scrubbed.length && r2 < row + 12; r2++) {
-					stmt += "\n" + scrubbed[r2];
+				const alias = useAliases.get(head);
+				const resolved = alias !== undefined ? [...alias.split("::"), ...segs.slice(1)] : segs;
+				const offset = resolved.length - segs.length; // segments the alias expanded into
+				for (let k = resolved.length - 1; k >= 1 + Math.max(0, offset); k--) {
+					const prefix = resolved.slice(0, k).join("::");
+					const modPath = alias !== undefined ? prefix : resolveModPath(prefix, selfMod);
+					if (modPath === null) break;
+					const file = lookupUse(ff, modPath);
+					if (!file) continue;
+					const found = findSymbolIn(file, resolved[k]);
+					if (!found) continue;
+					pushEdge(owner, found);
+					break;
 				}
-				const semi = stmt.indexOf(";");
-				if (semi >= 0) stmt = stmt.slice(0, semi);
-				pushEdge(owner, target, reWrite.test(stmt) ? "write" : "read", true);
 			}
+		}
+
+		// An included file calls back into the files that include it (module
+		// hooks such as `handle_message(…)`, defined by every module that
+		// splices the framework in): each includer's function of that name.
+		const includers = includedBy.get(ff) ?? [];
+		if (includers.length > 0) {
+			const hooks = new Map<string, ImportTarget[]>();
+			for (const inc of includers) {
+				for (const sym of inc.symbols) {
+					if (sym.kind === "function" && !localNames.has(sym.name)) pushTo(hooks, sym.name, { ff: inc, sym });
+				}
+			}
+			const reCall = /(?<![\w.:])(\w+)\s*\(/g;
+			let m: RegExpExecArray | null;
+			while ((m = reCall.exec(code)) !== null) {
+				const targets = hooks.get(m[1]);
+				if (!targets) continue;
+				const owner = ownerAt(rowAt(starts, m.index) + 1);
+				if (owner) for (const t of targets) pushEdge(owner, t);
+			}
+		}
+
+		// The generated-bindings module an SDK consumer site talks to: the one
+		// module crate named in the owning symbol (`region::DbConnection`),
+		// else the one named anywhere in the file.
+		const qualifiersIn = (from: number, to: number): Set<string> => {
+			const out = new Set<string>();
+			const re = /(?<![\w:])(\w+)\s*::/g;
+			for (let r = Math.max(0, from); r <= to && r < codeLines.length; r++) {
+				re.lastIndex = 0;
+				let q: RegExpExecArray | null;
+				while ((q = re.exec(codeLines[r])) !== null) if (moduleCrateNames.has(q[1])) out.add(q[1]);
+			}
+			return out;
+		};
+		let fileQualifier: string | null | undefined;
+		const ownerQualifiers = new Map<string, string | null>();
+		const qualifierFor = (owner: SymbolInfo): string | null => {
+			const key = `${owner.name}#${owner.occurrence}`;
+			const cached = ownerQualifiers.get(key);
+			if (cached !== undefined) return cached;
+			const own = qualifiersIn(owner.startLine - 1, owner.endLine - 1);
+			let q: string | null;
+			if (own.size > 0) q = own.size === 1 ? [...own][0] : null;
+			else {
+				if (fileQualifier === undefined) {
+					const all = qualifiersIn(0, codeLines.length - 1);
+					fileQualifier = all.size === 1 ? [...all][0] : null;
+				}
+				q = fileQualifier;
+			}
+			ownerQualifiers.set(key, q);
+			return q;
+		};
+
+		// SpacetimeDB table handles: `<receiver>.db.<accessor>()` → the
+		// accessor's struct (or view fn). Same-file tables are recorded here —
+		// the per-file detector only sees plain calls.
+		const moduleSide = isModuleSide(ff);
+		const reDb = /\.\s*db\s*\.\s*(\w+)\s*\(\s*\)/g;
+		let m: RegExpExecArray | null;
+		while ((m = reDb.exec(code)) !== null) {
+			const list = accessorCandidates.get(m[1]);
+			if (!list) continue;
+			const owner = ownerAt(rowAt(starts, m.index) + 1);
+			if (!owner) continue;
+			const chain = chainAfter(code, m.index + m[0].length);
+			if (moduleSide) {
+				const label = chain.some((c) => WRITE_METHODS.has(c)) ? "write" : "read";
+				for (const t of moduleTargets(ff, list)) pushEdge(owner, t, label, true);
+			} else {
+				const target = sdkTarget(list, qualifierFor(owner));
+				const callback = chain.length > 0 && /^on_(insert|update|delete)$/.test(chain[0]);
+				if (target) pushEdge(owner, target, callback ? "callback" : "read");
+			}
+		}
+		if (moduleSide) continue;
+
+		// SDK reducer calls: `.reducers.<name>(` / `.reducers.<name>_then(`
+		// call it, `.reducers.on_<name>(` registers a result callback.
+		const reReducer = /\.\s*reducers\s*\.\s*(\w+)\s*\(/g;
+		while ((m = reReducer.exec(code)) !== null) {
+			let name = m[1];
+			let label = "rpc";
+			if (!reducerCandidates.has(name)) {
+				if (name.endsWith("_then")) name = name.slice(0, -"_then".length);
+				else if (name.startsWith("on_")) {
+					name = name.slice("on_".length);
+					label = "callback";
+				}
+			}
+			const owner = ownerAt(rowAt(starts, m.index) + 1);
+			if (!owner) continue;
+			const target = sdkTarget(reducerCandidates.get(name), qualifierFor(owner));
+			if (target) pushEdge(owner, target, label);
+		}
+
+		// Typed subscription queries: `<bindings>::<accessor>QueryTableAccess::<accessor>(&q.from)`.
+		const reQuery = /\b(\w+)\s*::\s*\w+?QueryTableAccess\s*::\s*(\w+)/g;
+		while ((m = reQuery.exec(code)) !== null) {
+			const owner = ownerAt(rowAt(starts, m.index) + 1);
+			if (!owner) continue;
+			const qualifier = moduleCrateNames.has(m[1]) ? m[1] : qualifierFor(owner);
+			const target = sdkTarget(accessorCandidates.get(m[2]), qualifier);
+			if (target) pushEdge(owner, target, "subscribe");
 		}
 	}
 

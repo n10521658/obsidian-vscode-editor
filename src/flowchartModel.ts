@@ -10,8 +10,8 @@ import { isIgnoredFolderPath, parseIgnorePatterns } from "./folderIgnore";
  * in scope, their linkable symbols (per the plugin settings), a vault-scope
  * index of SpacetimeDB reducers, and heuristic edges (client `Reducers.*`
  * call sites, client `.Db.*` table reads, same-file Rust calls, cross-file
- * Rust references — see flowchartCrossEdges.ts — and `.tscn` scene wiring —
- * see flowchartTscn.ts).
+ * Rust references and SpacetimeDB table / Rust SDK usage — see
+ * flowchartCrossEdges.ts — and `.tscn` scene wiring — see flowchartTscn.ts).
  *
  * `.tscn` files are always collected (unioned into the passed extensions)
  * even though they predate the extension setting: they carry the client app's
@@ -340,14 +340,16 @@ async function detectTableNameStrings(plugin: CodeFilesPlugin, model: FlowchartM
 /**
  * A Rust function is a reducer when a `#[...reducer...]` attribute sits in the
  * contiguous attribute/doc block directly above it (paren-balance-aware, so
- * multi-line attribute blocks don't truncate the search).
+ * multi-line attribute blocks don't truncate the search). Doc comments are
+ * skipped: `/// Called by every admin reducer.` above a helper is prose.
  */
 function detectReducerFns(content: string, symbols: SymbolInfo[]): Set<string> {
 	const lines = content.split("\n");
 	const out = new Set<string>();
 	for (const sym of symbols) {
 		for (const row of attributeRowsAbove(lines, sym.startLine)) {
-			if (lines[row - 1].includes("reducer")) {
+			const line = lines[row - 1].trim();
+			if (!line.startsWith("//") && /\breducer\b/.test(line)) {
 				out.add(sym.name);
 				break;
 			}
