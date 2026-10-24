@@ -1,5 +1,15 @@
 import { App } from "obsidian";
-import { Parser, Language, Node as SyntaxNode } from "web-tree-sitter";
+import { Parser, Language, Node as SyntaxNode, Tree } from "web-tree-sitter";
+
+/** Frees a parse tree's wasm memory; a corrupted heap can make delete() throw. */
+function deleteTree(tree: Tree | null): void {
+	if (!tree) return;
+	try {
+		tree.delete();
+	} catch (e) {
+		console.error("vscode-editor: tree-sitter tree cleanup failed", e);
+	}
+}
 
 export interface CodeSubpath {
 	linkpath: string;
@@ -121,6 +131,16 @@ export class SymbolResolver {
 	private pluginDir: string;
 	private parserReady: Promise<boolean> | null = null;
 	private languages = new Map<string, Promise<Language | null>>();
+	/**
+	 * One long-lived parser per symbol-capable extension. Each `new Parser()`
+	 * allocates wasm-side memory that only `parser.delete()` frees, so the old
+	 * create-per-file pattern leaked a parser per parsed file — scanning a
+	 * large vault (every `.rs`/`.cs` file) eventually corrupted the wasm heap
+	 * ("RuntimeError: memory access out of bounds" thrown from `parser.delete`
+	 * after ~4.7k parses). Trees are deleted right after their data is
+	 * extracted, so a shared parser stays flat over thousands of files.
+	 */
+	private parsers = new Map<string, Parser>();
 
 	constructor(app: App, pluginDir: string) {
 		this.app = app;
@@ -186,13 +206,12 @@ export class SymbolResolver {
 	): Promise<SymbolRange | null> {
 		const langSpec = LANGUAGE_BY_EXTENSION[extension];
 		if (!langSpec) return null;
-		const language = await this.loadLanguage(extension);
-		if (!language) return null;
+		const parser = await this.parserFor(extension);
+		if (!parser) return null;
 
-		const parser = new Parser();
+		let tree: Tree | null = null;
 		try {
-			parser.setLanguage(language);
-			const tree = parser.parse(content);
+			tree = parser.parse(content);
 			if (!tree) return null;
 			const matches: SyntaxNode[] = [];
 			this.collectSymbolNodes(tree.rootNode, this.typeMapFor(langSpec, kinds), name, matches);
@@ -218,7 +237,7 @@ export class SymbolResolver {
 			console.error("vscode-editor: tree-sitter parse failed", e);
 			return null;
 		} finally {
-			parser.delete();
+			deleteTree(tree);
 		}
 	}
 
@@ -233,13 +252,12 @@ export class SymbolResolver {
 	): Promise<SymbolInfo[]> {
 		const langSpec = LANGUAGE_BY_EXTENSION[extension];
 		if (!langSpec) return [];
-		const language = await this.loadLanguage(extension);
-		if (!language) return [];
+		const parser = await this.parserFor(extension);
+		if (!parser) return [];
 
-		const parser = new Parser();
+		let tree: Tree | null = null;
 		try {
-			parser.setLanguage(language);
-			const tree = parser.parse(content);
+			tree = parser.parse(content);
 			if (!tree) return [];
 			const typeMap = this.typeMapFor(langSpec, kinds);
 			const nodes: SyntaxNode[] = [];
@@ -270,8 +288,35 @@ export class SymbolResolver {
 			console.error("vscode-editor: tree-sitter parse failed", e);
 			return [];
 		} finally {
-			parser.delete();
+			deleteTree(tree);
 		}
+	}
+
+	/** Drops every cached parser (plugin unload); they are recreated lazily. */
+	dispose(): void {
+		for (const parser of this.parsers.values()) {
+			try {
+				parser.delete();
+			} catch (e) {
+				// A corrupted wasm heap can make delete() itself throw — nothing to do.
+				console.error("vscode-editor: tree-sitter parser cleanup failed", e);
+			}
+		}
+		this.parsers.clear();
+	}
+
+	/** The shared parser for `extension`, reusing the same wasm allocation every call. */
+	private async parserFor(extension: string): Promise<Parser | null> {
+		const existing = this.parsers.get(extension);
+		if (existing) return existing;
+		const language = await this.loadLanguage(extension);
+		if (!language) return null;
+		const raced = this.parsers.get(extension);
+		if (raced) return raced;
+		const parser = new Parser();
+		parser.setLanguage(language);
+		this.parsers.set(extension, parser);
+		return parser;
 	}
 
 	private typeMapFor(langSpec: { symbolTypes: SymbolTypeSpec[] }, kinds: SymbolKind[]): Map<string, SymbolKind> {

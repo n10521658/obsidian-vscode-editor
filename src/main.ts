@@ -211,6 +211,8 @@ export default class CodeFilesPlugin extends Plugin {
 
 	onunload() {
 		this.observer.disconnect();
+		// Free the long-lived tree-sitter parsers (see SymbolResolver.parsers).
+		this.symbolResolver?.dispose();
 	}
 
 

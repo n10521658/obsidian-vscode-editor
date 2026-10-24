@@ -3,6 +3,7 @@ import CodeFilesPlugin from "./main";
 import { SymbolInfo, isSymbolCapableExtension } from "./symbolResolver";
 import { CROSS_EDGE_KINDS, CrossSymbolEdge, ImportTarget, attributeRowsAbove, detectCrossFileEdges } from "./flowchartCrossEdges";
 import { TscnRef, detectTscnRefs } from "./flowchartTscn";
+import { isIgnoredFolderPath, parseIgnorePatterns } from "./folderIgnore";
 
 /**
  * Builds the code-graph model behind the flowchart canvases: which files are
@@ -20,6 +21,13 @@ import { TscnRef, detectTscnRefs } from "./flowchartTscn";
 /** A heuristic edge detected from a file's code (symbol → symbol / reducer / table). */
 export interface AutoEdge {
 	from: string;
+	/**
+	 * 1-based occurrence pinning `from` to a specific same-named owner symbol
+	 * (overloads sharing a name). Set by all detectors from the owning
+	 * `SymbolInfo`; consumers fall back to the first match when unset
+	 * (legacy edges).
+	 */
+	fromOccurrence?: number;
 	to: string;
 	label?: string;
 	/**
@@ -53,12 +61,12 @@ function isGeneratedFile(file: TFile): boolean {
 	return file.name.endsWith(".g.cs");
 }
 
-/** An edge owned by a file itself rather than a symbol (`.tscn` wiring). */
+/** An edge owned by a file itself rather than a symbol (`.tscn` wiring, module imports). */
 export interface ResolvedFileEdge {
 	toFile: TFile;
 	/** The targeted symbol (attached script's class, bound table's struct/view fn); null = whole file. */
 	toSym: SymbolInfo | null;
-	/** `script` / `scene` / `bind`. */
+	/** `script` / `scene` / `class` / `bind` for `.tscn` wiring, `import` for `use` statements. */
 	label: string;
 }
 
@@ -71,8 +79,17 @@ export interface FlowchartFile {
 	detectedEdges: AutoEdge[];
 	/** Resolved cross-file reference edges (rs via flowchartCrossEdges.ts, plus C# table-name strings). */
 	crossDetectedEdges: CrossSymbolEdge[];
-	/** File-owned edges (`.tscn` script/scene/table wiring); empty for code files. */
+	/** File-owned edges (`.tscn` script/scene/class/table wiring); empty for non-scene files. */
 	fileEdges: ResolvedFileEdge[];
+	/**
+	 * Module-level `use`/`pub use` statements that name another in-scope file's
+	 * symbol without the name ever appearing inside a declaration (see
+	 * flowchartCrossEdges.ts). File-owned like the `.tscn` wiring, but *not*
+	 * drawn on flowchart canvases — they are import noise there. Only the
+	 * pointer index consumes them, as a fallback when no symbol-level usage of
+	 * the same target exists in that file.
+	 */
+	importEdges: ResolvedFileEdge[];
 }
 
 export interface ReducerTarget {
@@ -92,15 +109,23 @@ export interface FlowchartModel {
 /**
  * Recursively collects matching files under `folder`, skipping generated/output dirs.
  * `includeGenerated` opts back in to `*.g.cs`-style generated binding files, which are
- * excluded by default (`settings.includeGeneratedCodeFiles`).
+ * excluded by default (`settings.includeGeneratedCodeFiles`). `ignoredFolders` are the
+ * user's folder-ignore patterns (`settings.ignoredFolders`, see folderIgnore.ts) — a
+ * matching folder and everything under it are skipped.
  */
-export function collectCodeFiles(folder: TFolder, extensions: string[], includeGenerated = false): TFile[] {
+export function collectCodeFiles(
+	folder: TFolder,
+	extensions: string[],
+	includeGenerated = false,
+	ignoredFolders: string[] = [],
+): TFile[] {
 	const out: TFile[] = [];
 	const walk = (dir: TFolder) => {
 		for (const child of dir.children) {
 			if (child instanceof TFolder) {
 				if (SKIP_DIR_NAMES.has(child.name) || child.name.startsWith(".")) continue;
 				if (!includeGenerated && GENERATED_DIR_NAMES.has(child.name)) continue;
+				if (isIgnoredFolderPath(child.path, ignoredFolders)) continue;
 				walk(child);
 			} else if (child instanceof TFile) {
 				if (!includeGenerated && isGeneratedFile(child)) continue;
@@ -114,9 +139,15 @@ export function collectCodeFiles(folder: TFolder, extensions: string[], includeG
 }
 
 /** Counts matching files per extension under a folder (for menu labels). */
-export function countByExtension(folder: TFolder, extensions: string[], includeGenerated = false): Map<string, number> {
+export function countByExtension(
+	folder: TFolder,
+	extensions: string[],
+	includeGenerated = false,
+	ignoredFolders: string[] = [],
+): Map<string, number> {
 	const counts = new Map<string, number>();
-	for (const file of collectCodeFiles(folder, [...new Set([...extensions, "tscn"])], includeGenerated)) {
+	const exts = [...new Set([...extensions, "tscn"])];
+	for (const file of collectCodeFiles(folder, exts, includeGenerated, ignoredFolders)) {
 		counts.set(file.extension, (counts.get(file.extension) ?? 0) + 1);
 	}
 	return counts;
@@ -135,7 +166,8 @@ export async function buildFlowchartModel(
 	/** Raw refs of each `.tscn` file, resolved in the post-pass below. */
 	const tscnRefs = new Map<FlowchartFile, TscnRef[]>();
 
-	for (const file of collectCodeFiles(root, exts, plugin.settings.includeGeneratedCodeFiles)) {
+	const ignoredFolders = parseIgnorePatterns(plugin.settings.ignoredFolders);
+	for (const file of collectCodeFiles(root, exts, plugin.settings.includeGeneratedCodeFiles, ignoredFolders)) {
 		const content = await plugin.app.vault.cachedRead(file);
 		const symbols = isSymbolCapableExtension(file.extension)
 			? await plugin.symbolResolver.listSymbols(content, file.extension, plugin.settings.linkableSymbolKinds)
@@ -146,7 +178,15 @@ export async function buildFlowchartModel(
 		const reducerFns = file.extension === "rs" ? detectReducerFns(content, functions) : new Set<string>();
 		const detectedEdges = detectHeuristicEdges(content, file.extension, functions);
 
-		const entry: FlowchartFile = { file, symbols, reducerFns, detectedEdges, crossDetectedEdges: [], fileEdges: [] };
+		const entry: FlowchartFile = {
+			file,
+			symbols,
+			reducerFns,
+			detectedEdges,
+			crossDetectedEdges: [],
+			fileEdges: [],
+			importEdges: [],
+		};
 		model.files.push(entry);
 		if (file.extension === "tscn") tscnRefs.set(entry, detectTscnRefs(content));
 
@@ -184,7 +224,9 @@ function godotRootFor(file: TFile): string | null {
  * project root; refs whose target leaves the vault are dropped. Script refs
  * target the script's class symbol when one is in scope (basename match, else
  * first class), scene refs are whole-file, table refs resolve a PascalCase
- * name against the accessor index.
+ * name against the accessor index, and custom node types (`type="KgX"`, the
+ * GDExtension wiring) resolve against the scanned class/struct symbols — a
+ * built-in Godot type matches nothing and is dropped.
  */
 function resolveTscnFileEdges(
 	plugin: CodeFilesPlugin,
@@ -193,6 +235,18 @@ function resolveTscnFileEdges(
 ): void {
 	const app = plugin.app;
 	const byPath = new Map(model.files.map((ff) => [ff.file.path, ff]));
+	// Custom node type name → declaring symbol. Rust GDExtension classes are
+	// structs (C# ones are classes); a name matching neither is a built-in.
+	const classIndex = new Map<string, ImportTarget>();
+	for (const ff of model.files) {
+		for (const sym of ff.symbols) {
+			if (sym.kind !== "class" && sym.kind !== "struct") continue;
+			const existing = classIndex.get(sym.name);
+			if (!existing || (existing.sym.kind !== "class" && sym.kind === "class")) {
+				classIndex.set(sym.name, { ff, sym });
+			}
+		}
+	}
 	for (const [ff, refs] of tscnRefs) {
 		const godotRoot = godotRootFor(ff.file);
 		const seen = new Set<string>();
@@ -206,6 +260,11 @@ function resolveTscnFileEdges(
 			if (ref.kind === "table") {
 				const target = model.accessorIndex.get(toSnakeCase(ref.tableName!));
 				if (target) push(target.ff.file, target.sym, "bind");
+				continue;
+			}
+			if (ref.kind === "class") {
+				const target = classIndex.get(ref.className!);
+				if (target) push(target.ff.file, target.sym, "class");
 				continue;
 			}
 			if (!godotRoot || !ref.resPath) continue;
@@ -342,10 +401,10 @@ function detectReducerCalls(content: string, symbols: SymbolInfo[]): AutoEdge[] 
 		while ((m = re.exec(lines[row])) !== null) {
 			const owner = innermostOwner(symbols, row + 1);
 			if (!owner) continue;
-			const key = `${owner.name}->${m[1]}`;
+			const key = `${owner.name}#${owner.occurrence}->${m[1]}`;
 			if (seen.has(key)) continue;
 			seen.add(key);
-			out.push({ from: owner.name, to: `reducer:${toSnakeCase(m[1])}`, label: "rpc" });
+			out.push({ from: owner.name, fromOccurrence: owner.occurrence, to: `reducer:${toSnakeCase(m[1])}`, label: "rpc" });
 		}
 	}
 	return out;
@@ -369,10 +428,10 @@ function detectTableReads(content: string, symbols: SymbolInfo[]): AutoEdge[] {
 		while ((m = re.exec(lines[row])) !== null) {
 			const owner = innermostOwner(symbols, row + 1);
 			if (!owner) continue;
-			const key = `${owner.name}->${m[1]}`;
+			const key = `${owner.name}#${owner.occurrence}->${m[1]}`;
 			if (seen.has(key)) continue;
 			seen.add(key);
-			out.push({ from: owner.name, to: `table:${m[1]}`, label: "read" });
+			out.push({ from: owner.name, fromOccurrence: owner.occurrence, to: `table:${m[1]}`, label: "read" });
 		}
 	}
 	return out;
@@ -420,11 +479,11 @@ function detectSameFileCalls(content: string, symbols: SymbolInfo[]): AutoEdge[]
 			if (!owner) continue;
 			const callee = candidates[0];
 			if (owner.name === callee.name && owner.occurrence === callee.occurrence) continue;
-			const key = `${owner.name}->${callee.name}#${callee.occurrence}`;
+			const key = `${owner.name}#${owner.occurrence}->${callee.name}#${callee.occurrence}`;
 			if (seen.has(key)) continue;
 			seen.add(key);
-			seenNames.add(`${owner.name}->${callee.name}`);
-			out.push({ from: owner.name, to: callee.name, toOccurrence: callee.occurrence });
+			seenNames.add(`${owner.name}#${owner.occurrence}->${callee.name}`);
+			out.push({ from: owner.name, fromOccurrence: owner.occurrence, to: callee.name, toOccurrence: callee.occurrence });
 		}
 	}
 
@@ -443,10 +502,10 @@ function detectSameFileCalls(content: string, symbols: SymbolInfo[]): AutoEdge[]
 			if (!matched) continue;
 			const owner = innermostOwner(symbols, row + 1);
 			if (!owner || owner.name === callee.name) continue;
-			const key = `${owner.name}->${callee.name}`;
+			const key = `${owner.name}#${owner.occurrence}->${callee.name}`;
 			if (seenNames.has(key)) continue;
 			seenNames.add(key);
-			out.push({ from: owner.name, to: callee.name, toOccurrence: callee.occurrence });
+			out.push({ from: owner.name, fromOccurrence: owner.occurrence, to: callee.name, toOccurrence: callee.occurrence });
 		}
 	}
 	return out;

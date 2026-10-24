@@ -25,6 +25,12 @@ export interface EditorSettings {
 	pruneStaleFlowcharts: boolean;
 	/** Whether pruning uses the system trash instead of the vault trash. */
 	pruneToSystemTrash: boolean;
+	/**
+	 * Folders skipped by every code scan (flowchart generation and pointer
+	 * files) — vault-relative paths or bare names, `*` wildcards allowed.
+	 * See folderIgnore.ts for the matching rules.
+	 */
+	ignoredFolders: string[];
 }
 
 export const DEFAULT_SETTINGS: EditorSettings = {
@@ -48,6 +54,7 @@ export const DEFAULT_SETTINGS: EditorSettings = {
 	includeGeneratedCodeFiles: false,
 	pruneStaleFlowcharts: true,
 	pruneToSystemTrash: false,
+	ignoredFolders: [],
 }
 
 

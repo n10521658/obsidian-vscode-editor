@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import CodeFilesPlugin from "./main";
 import { SymbolKind } from "./symbolResolver";
+import { parseIgnorePatterns } from "./folderIgnore";
 import { t } from 'src/lang/helpers';
 
 
@@ -192,6 +193,26 @@ export class CodeFilesSettingsTab extends PluginSettingTab {
 					}));
 		}
 
+
+		containerEl.createEl('h2', { text: 'Code scanning' });
+
+		new Setting(containerEl)
+			.setName('Ignored folders')
+			.setDesc(
+				'Folders skipped by every code scan — flowchart generation and "Generate pointers in subfolders" ' +
+				'(ignored folders are neither indexed nor listed as consumers). One pattern per line, or comma-separated. ' +
+				'A bare name matches that folder at any depth (`target` skips every `target/`); a path matches that spot ' +
+				'(`server/target`); `*` matches within one segment (`client/*/bindings`) and `**` across segments. ' +
+				'Case-insensitive. `node_modules`, `flowcharts`, `module_bindings` and dot-folders are always skipped.',
+			)
+			.addTextArea(text => text
+				.setValue(parseIgnorePatterns(this.plugin.settings.ignoredFolders).join("\n"))
+				.setPlaceholder('target\nbuild\nbindings\ndocs/AI/REFERENCES')
+				.onChange(async (value) => {
+					this.plugin.settings.ignoredFolders = parseIgnorePatterns(value);
+					await this.plugin.saveSettings();
+				}))
+			.setClass("setting_ext");
 
 		containerEl.createEl('h2', { text: 'Flowcharts' });
 

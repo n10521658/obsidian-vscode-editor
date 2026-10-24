@@ -23,6 +23,12 @@ import {
 } from "./flowchartCanvas";
 import { RegenerateResult, regenerateFromMetadata } from "./flowchartAggregate";
 import {
+	PointerGranularity,
+	PointerResult,
+	generatePointersInSubfolders,
+	pointerTargetFolders,
+} from "./pointerFiles";
+import {
 	FlowsValidation,
 	createFlow as createFlowManifest,
 	flowchartsFolderForPath,
@@ -32,6 +38,7 @@ import {
 	validateFlows as validateFlowsManifest,
 } from "./flowchartFlows";
 import { findCanvasNode } from "./canvasNarrow";
+import { isIgnoredFolderPath, parseIgnorePatterns } from "./folderIgnore";
 
 /**
  * File-explorer + canvas-node context menus for the flowchart feature:
@@ -58,14 +65,23 @@ import { findCanvasNode } from "./canvasNarrow";
  *                   ON), scoped to canvases within N levels of subfolders
  *                   instead of the whole recursive scan (depth 0 = the
  *                   folder's own canvases only)
+  *   any code folder ▸ "Generate pointers in subfolders" ▸ File granularity
+  *                 / Symbol granularity — writes one generated `pointers.md`
+  *                 into each immediate subfolder (file: one `## {file}`
+  *                 section per code file; symbol: one `## {file}#{symbol}`
+  *                 section per linkable symbol, overwriting the same file)
+  *                 with its consumer entries directly underneath; see
+  *                 pointerFiles.ts and pointerConsumers.ts), so docs can point
+  *                 at the generated file instead of hand-maintained file lists
  *
  * For a folder or multi-selection, if the aggregate-targeted canvases have
  * mixed include state, both "Include all" and "Exclude all" are offered
  * instead of a single toggle.
  *
  * Palette commands registered here: "Regenerate all flowcharts",
- * "Generate flowcharts from code…" (folder picker), and "Generate aggregate
- * flowchart from subflowchart metadata…" (folder picker).
+ * "Generate flowcharts from code…" (folder picker), "Generate aggregate
+ * flowchart from subflowchart metadata…" (folder picker), and "Generate
+ * pointers in subfolders…" (folder picker).
  *
  * Every FlowchartCommands method returns a plain-JSON result (also stashed on
  * `commands.lastResult`) for eval-driven workflows; Notices stay short
@@ -119,6 +135,16 @@ export interface FlowchartCommands {
 	): Promise<{ name: string; created: boolean; flows: Record<string, string[]> } | null>;
 	/** Read-only flows.json health check — reports missing member canvases without composing. */
 	validateFlows(scope: TFolder | TFile[]): Promise<ValidateFlowsResult>;
+	/**
+	 * Writes a generated `pointers.md` into each immediate subfolder of
+	 * `folder` (or into `folder` itself when it has no subfolders),
+	 * overwriting whatever is there: file granularity writes one
+	 * `## {file}` section per in-folder code file, symbol granularity
+	 * writes one `## {file}#{symbol}` section per linkable symbol, both
+	 * with their consumer entries directly underneath. Re-run after file
+	 * renames instead of hand-maintaining per-doc file lists.
+	 */
+	generatePointers(folder: TFolder, extensions?: string[], granularity?: PointerGranularity): Promise<PointerResult | null>;
 	/** True while a generate/regenerate job is running or queued (see runExclusive). */
 	isRunning(): boolean;
 	/** Resolves once no generate/regenerate job is running or queued. */
@@ -266,9 +292,10 @@ export function setupFlowchartMenus(plugin: CodeFilesPlugin): FlowchartCommands 
 			return runExclusive(async () => {
 				if (!requireAdvancedCanvas(plugin.app)) return null;
 				const exts = extensions ?? plugin.settings.extensions;
+				const ignoredFolders = parseIgnorePatterns(plugin.settings.ignoredFolders);
 				const result: RegenerateAllResult = { trees: [] };
 				// Strictly sequential — concurrent vault writes race.
-				for (const flowchartsFolder of discoverFlowchartTrees(plugin.app)) {
+				for (const flowchartsFolder of discoverFlowchartTrees(plugin.app, ignoredFolders)) {
 					const parent = flowchartsFolder.parent;
 					if (!parent) continue;
 					const model = await buildFlowchartModel(plugin, parent, exts);
@@ -392,6 +419,31 @@ export function setupFlowchartMenus(plugin: CodeFilesPlugin): FlowchartCommands 
 			return result;
 		},
 
+		async generatePointers(folder, extensions, granularity = "file") {
+			return runExclusive(async () => {
+				const result = await generatePointersInSubfolders(plugin, folder, extensions, granularity);
+				commands.lastResult = result;
+				if (result.written.length === 0) {
+					new Notice("vscode-editor: no subfolders to write pointers into.");
+				} else if (granularity === "symbol") {
+					const symbols = result.targets.reduce((a, t) => a + (t.symbolCount ?? 0), 0);
+					const consumers = result.targets.reduce((a, t) => a + (t.consumerSymbolCount ?? t.consumerCount), 0);
+					new Notice(
+						`vscode-editor: wrote ${result.written.length} symbol pointer file(s) ` +
+						`(${symbols} symbol(s) indexed, ${consumers} consumer symbol link(s)). Re-run after renames — never hand-edit.`,
+					);
+				} else {
+					const files = result.targets.reduce((a, t) => a + t.fileCount, 0);
+					const consumers = result.targets.reduce((a, t) => a + t.consumerCount, 0);
+					new Notice(
+						`vscode-editor: wrote ${result.written.length} pointer file(s) ` +
+						`(${files} code files indexed, ${consumers} consumer link(s)). Re-run after renames — never hand-edit.`,
+					);
+				}
+				return result;
+			});
+		},
+
 		isRunning() {
 			return running > 0;
 		},
@@ -415,6 +467,7 @@ export function setupFlowchartMenus(plugin: CodeFilesPlugin): FlowchartCommands 
 		plugin.app.workspace.on("file-menu", (menu, file) => {
 			if (file instanceof TFolder) {
 				addFolderMenuItems(plugin, menu, file, commands);
+				addPointerMenuItem(plugin, menu, file, commands);
 				const canvases = collectCanvasFiles(file);
 				addFlowMenuItems(plugin, menu, canvases, flowsCache, commands);
 				addIncludeMenuItems(plugin, menu, canvases, aggregateSpec);
@@ -466,6 +519,15 @@ export function setupFlowchartMenus(plugin: CodeFilesPlugin): FlowchartCommands 
 			).open();
 		},
 	});
+	plugin.addCommand({
+		id: "generate-pointers-in-subfolders",
+		name: "Generate pointers in subfolders…",
+		callback: () => {
+			new FolderSuggestModal(plugin.app, (folder) =>
+				void commands.generatePointers(folder),
+			).open();
+		},
+	});
 
 	return commands;
 }
@@ -478,7 +540,12 @@ function addFolderMenuItems(
 	folder: TFolder,
 	commands: FlowchartCommands,
 ): void {
-	const counts = countByExtension(folder, plugin.settings.extensions, plugin.settings.includeGeneratedCodeFiles);
+	const counts = countByExtension(
+		folder,
+		plugin.settings.extensions,
+		plugin.settings.includeGeneratedCodeFiles,
+		parseIgnorePatterns(plugin.settings.ignoredFolders),
+	);
 	if (counts.size === 0) return;
 	const total = [...counts.values()].reduce((a, b) => a + b, 0);
 
@@ -534,6 +601,66 @@ function addRegenerateMenuItem(
 			.setIcon("workflow")
 			.onClick(() => void commands.regenerate(scope)),
 	);
+}
+
+/**
+ * Folder context-menu item behind the generated pointer files (see
+ * pointerFiles.ts): "Generate pointers in subfolders" ▸ File granularity /
+ * Symbol granularity — writes one `pointers.md` into each immediate
+ * subfolder (file granularity: one `## {file}` section per code file;
+ * symbol granularity: one `## {file}#{symbol}` section per linkable
+ * symbol, overwriting the same file), indexing its code and annotated
+ * vault-wide consumers. Offered on any folder that has eligible subfolders
+ * (or code files, so it also works on a single leaf module folder).
+ */
+function addPointerMenuItem(
+	plugin: CodeFilesPlugin,
+	menu: Menu,
+	folder: TFolder,
+	commands: FlowchartCommands,
+): void {
+	const includeGenerated = plugin.settings.includeGeneratedCodeFiles;
+	const ignoredFolders = parseIgnorePatterns(plugin.settings.ignoredFolders);
+	const targets = pointerTargetFolders(folder, includeGenerated, ignoredFolders);
+	if (targets.length === 0) {
+		if (countByExtension(folder, plugin.settings.extensions, includeGenerated, ignoredFolders).size === 0) return;
+	}
+	const suffix = targets.length > 1 ? ` (${targets.length})` : "";
+	menu.addItem((item) => {
+		item.setTitle(`Generate pointers in subfolders${suffix}`).setIcon("link");
+		withSubmenu(
+			item,
+			(sub) => {
+				sub.addItem((subItem) =>
+					subItem
+						.setTitle("File granularity")
+						.setIcon("link")
+						.onClick(() => void commands.generatePointers(folder, undefined, "file")),
+				);
+				sub.addItem((subItem) =>
+					subItem
+						.setTitle("Symbol granularity")
+						.setIcon("link")
+						.onClick(() => void commands.generatePointers(folder, undefined, "symbol")),
+				);
+			},
+			// Flat fallback: "Generate pointers in subfolders (file)" etc.
+			() => {
+				menu.addItem((flat) =>
+					flat
+						.setTitle(`Generate pointers in subfolders (file${suffix})`)
+						.setIcon("link")
+						.onClick(() => void commands.generatePointers(folder, undefined, "file")),
+				);
+				menu.addItem((flat) =>
+					flat
+						.setTitle(`Generate pointers in subfolders (symbol${suffix})`)
+						.setIcon("link")
+						.onClick(() => void commands.generatePointers(folder, undefined, "symbol")),
+				);
+			},
+		);
+	});
 }
 
 /**
@@ -814,12 +941,14 @@ function allFolders(app: App): TFolder[] {
 
 /**
  * Every `flowcharts` folder holding a generated tree: a `Subflowcharts`
- * child folder or a flows.json manifest.
+ * child folder or a flows.json manifest. Trees inside an ignored folder are
+ * skipped (`ignoredFolders` = `settings.ignoredFolders`).
  */
-function discoverFlowchartTrees(app: App): TFolder[] {
+function discoverFlowchartTrees(app: App, ignoredFolders: string[] = []): TFolder[] {
 	return allFolders(app).filter(
 		(folder) =>
 			folder.name === "flowcharts" &&
+			!isIgnoredFolderPath(folder.path, ignoredFolders) &&
 			folder.children.some(
 				(c) =>
 					(c instanceof TFolder && c.name === "Subflowcharts") ||

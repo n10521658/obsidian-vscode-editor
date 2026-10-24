@@ -40,6 +40,14 @@ import { FlowchartFile, toSnakeCase } from "./flowchartModel";
  * tracked, a name exported by two glob imports resolves to the first import,
  * and two crates exporting the same module path collide first-wins. All of
  * these simply yield no edge when they fail to resolve.
+ *
+ * Module-level imports are recorded separately on `FlowchartFile.importEdges`
+ * (file-owned, like `.tscn` wiring — never drawn as flowchart edges). A
+ * `use`/`pub use` that names an in-scope symbol but never mentions it inside
+ * any declaration is still a real reference: a GDExtension `lib.rs` registers
+ * every class by re-exporting it, so without this the class's own module would
+ * look unused. The pointer index renders these as "imports …" only when no
+ * deeper symbol-level usage exists.
  */
 
 /** Symbol kinds that may own or receive a cross-file edge (variables excluded). */
@@ -253,22 +261,71 @@ export async function detectCrossFileEdges(
 ): Promise<Map<string, ImportTarget>> {
 	const rsFiles = files.filter((ff) => ff.file.extension === "rs");
 
-	// Module path → file, for `use` resolution.
+	// Module path → file, for `use` resolution. Module paths are only unique
+	// per crate (`kg_editor/src/ui.rs` and `kg_gdext/src/ui/mod.rs` are both
+	// `ui`), so the index is keyed by the file's crate base too — otherwise the
+	// first crate scanned would swallow the other's `crate::…` imports.
 	const modIndex = new Map<string, FlowchartFile>();
+	const crateKeyCache = new Map<string, string>();
+	const crateKey = (file: TFile): string => {
+		let key = crateKeyCache.get(file.path);
+		if (key === undefined) {
+			key = crateBaseFor(file) ?? root.path;
+			crateKeyCache.set(file.path, key);
+		}
+		return key;
+	};
 	for (const ff of rsFiles) {
 		const mod = modulePathFor(root, ff.file);
-		if (mod !== null && !modIndex.has(mod)) modIndex.set(mod, ff);
+		const key = mod === null ? null : `${crateKey(ff.file)}|${mod}`;
+		if (key !== null && !modIndex.has(key)) modIndex.set(key, ff);
 	}
+	/** The file declaring the module at `mod` in the same crate as `from`. */
+	const lookupModule = (from: FlowchartFile, mod: string): FlowchartFile | undefined =>
+		modIndex.get(`${crateKey(from.file)}|${mod}`);
+
+	// Crate directory name → crate base, so an import of a SIBLING in-repo crate
+	// (`use kg_hex::axial::Axial;` inside kg_sim) resolves too. Without this a
+	// workspace crate's folder looks consumer-free even though every other crate
+	// uses it. Folder name is the crate name here (Cargo manifests are not
+	// parsed); first crate wins on a name clash.
+	const crateBases = new Map<string, string>();
+	for (const ff of rsFiles) {
+		const base = crateKey(ff.file);
+		if (base === root.path) continue; // no Cargo.toml above this file
+		const dir = base.endsWith("/src") ? base.slice(0, -"/src".length) : base;
+		const name = dir.split("/").pop();
+		if (name && !crateBases.has(name)) crateBases.set(name, base);
+	}
+	/** Same-crate first, then a sibling crate named by the path's first segment. */
+	const lookupUse = (from: FlowchartFile, mod: string): FlowchartFile | undefined => {
+		const local = lookupModule(from, mod);
+		if (local) return local;
+		const cut = mod.indexOf("::");
+		if (cut < 0) {
+			// `use kg_hex::{A, B};` — the whole path is a crate name, i.e. that
+			// crate's root module (`lib.rs`, module path "").
+			const rootBase = crateBases.get(mod);
+			return rootBase ? modIndex.get(`${rootBase}|`) : undefined;
+		}
+		const externalBase = crateBases.get(mod.slice(0, cut));
+		if (!externalBase) return undefined;
+		return modIndex.get(`${externalBase}|${mod.slice(cut + 2)}`);
+	};
 
 	// Read every Rust file once; build the SpacetimeDB accessor index
 	// (`#[table(accessor = X)]` above a struct, `#[…::view(accessor = X)]`
 	// above a fn — both bare and `spacetimedb::`-qualified attributes) and
 	// stash the lines for later.
 	const linesByFile = new Map<FlowchartFile, string[]>();
+	/** Each file's parsed `use` statements — also the re-export table (see findSymbolIn). */
+	const useImportsByFile = new Map<FlowchartFile, UseImport[]>();
 	const accessorIndex = new Map<string, ImportTarget>();
 	for (const ff of rsFiles) {
 		const lines = (await app.vault.cachedRead(ff.file)).split("\n");
 		linesByFile.set(ff, lines);
+		const ffMod = modulePathFor(root, ff.file);
+		if (ffMod !== null) useImportsByFile.set(ff, parseUseImports(lines.join("\n"), ffMod));
 		for (const sym of ff.symbols) {
 			if (sym.kind !== "struct" && sym.kind !== "function") continue;
 			const attr = attributeRowsAbove(lines, sym.startLine)
@@ -283,6 +340,61 @@ export async function detectCrossFileEdges(
 		}
 	}
 
+	/**
+	 * The defining symbol `name` reachable from module `target`: defined there,
+	 * or re-exported (`pub use small::SmallHex;`) and therefore defined in a
+	 * submodule — the idiom that makes `use kg_hex::{SmallHex, Torus};` work in
+	 * Rust, where the crate root only re-exports. Follows one chain up to 3
+	 * hops, cycle-guarded.
+	 */
+	const findSymbolIn = (target: FlowchartFile, name: string, depth = 0): ImportTarget | null => {
+		const own = target.symbols.find((s) => s.name === name && CROSS_EDGE_KINDS.has(s.kind));
+		if (own) return { ff: target, sym: own };
+		if (depth >= 3) return null;
+		for (const imp of useImportsByFile.get(target) ?? []) {
+			if (imp.names === "*") {
+				const next = lookupUse(target, imp.mod);
+				if (!next || next === target) continue;
+				const found = findSymbolIn(next, name, depth + 1);
+				if (found) return found;
+				continue;
+			}
+			const hit = imp.names.find((n) => n.alias === name || n.name === name);
+			if (!hit) continue;
+			const next = lookupUse(target, imp.mod);
+			if (!next || next === target) continue;
+			const found = findSymbolIn(next, hit.name, depth + 1);
+			if (found) return found;
+		}
+		return null;
+	};
+
+	/** Every symbol a `use M::*;` brings in, following re-exports (cycle-guarded). */
+	const symbolsOfModule = (
+		target: FlowchartFile,
+		depth = 0,
+		seen = new Set<FlowchartFile>(),
+	): ImportTarget[] => {
+		if (seen.has(target) || depth > 3) return [];
+		seen.add(target);
+		const out: ImportTarget[] = target.symbols
+			.filter((s) => CROSS_EDGE_KINDS.has(s.kind))
+			.map((sym) => ({ ff: target, sym }));
+		for (const imp of useImportsByFile.get(target) ?? []) {
+			const next = lookupUse(target, imp.mod);
+			if (!next || next === target) continue;
+			if (imp.names === "*") {
+				out.push(...symbolsOfModule(next, depth + 1, seen));
+				continue;
+			}
+			for (const n of imp.names) {
+				const found = findSymbolIn(next, n.name, depth + 1);
+				if (found) out.push(found);
+			}
+		}
+		return out;
+	};
+
 	for (const ff of rsFiles) {
 		const lines = linesByFile.get(ff);
 		const selfMod = modulePathFor(root, ff.file);
@@ -292,22 +404,49 @@ export async function detectCrossFileEdges(
 		// imports; between two imports the first one wins.
 		const localNames = new Set(ff.symbols.map((s) => s.name));
 		const imported = new Map<string, ImportTarget>();
-		for (const imp of parseUseImports(lines.join("\n"), selfMod)) {
-			const target = modIndex.get(imp.mod);
+		const importSeen = new Set<string>();
+		for (const imp of useImportsByFile.get(ff) ?? []) {
+			const target = lookupUse(ff, imp.mod);
 			if (!target) continue;
 			if (imp.names === "*") {
-				for (const sym of target.symbols) {
-					if (!CROSS_EDGE_KINDS.has(sym.kind)) continue;
+				for (const found of symbolsOfModule(target)) {
+					const { sym } = found;
 					if (localNames.has(sym.name) || imported.has(sym.name)) continue;
-					imported.set(sym.name, { ff: target, sym });
+					imported.set(sym.name, found);
 				}
 			} else {
 				for (const { name, alias } of imp.names) {
 					if (localNames.has(alias) || imported.has(alias)) continue;
-					const sym = target.symbols.find((s) => s.name === name && CROSS_EDGE_KINDS.has(s.kind));
-					if (sym) imported.set(alias, { ff: target, sym });
+					const found = findSymbolIn(target, name);
+					if (!found) continue;
+					imported.set(alias, found);
+					// Module-level `use`/`pub use` of another file's symbol is a
+					// real reference even when the name never appears inside a
+					// declaration (GDExtension `lib.rs` re-export hubs). Recorded
+					// as a file-owned edge for the pointer index only.
+					if (found.ff === ff) continue;
+					const key = `${found.ff.file.path}#${found.sym.name}`;
+					if (importSeen.has(key)) continue;
+					importSeen.add(key);
+					ff.importEdges.push({ toFile: found.ff.file, toSym: found.sym, label: "import" });
 				}
 			}
+		}
+
+		// `mod <name>;` declarations — `lib.rs`/parent `mod.rs` pointing at a
+		// child module file. Not a symbol reference, but the child module's own
+		// file (and its `mod.rs`) is only reachable through it.
+		const reModDecl = /^[ \t]*(?:pub[ \t]+)?mod[ \t]+(\w+)[ \t]*;/gm;
+		const joined = lines.join("\n");
+		let modDecl: RegExpExecArray | null;
+		while ((modDecl = reModDecl.exec(joined)) !== null) {
+			const childMod = selfMod.length > 0 ? `${selfMod}::${modDecl[1]}` : modDecl[1];
+			const target = lookupModule(ff, childMod);
+			if (!target || target === ff) continue;
+			const key = `${target.file.path}#`;
+			if (importSeen.has(key)) continue;
+			importSeen.add(key);
+			ff.importEdges.push({ toFile: target.file, toSym: null, label: "declare module" });
 		}
 
 		// Attribute/doc lines directly above a symbol are owned by that symbol
