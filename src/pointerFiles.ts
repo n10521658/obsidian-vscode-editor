@@ -11,8 +11,10 @@ import { SymbolInfo } from "./symbolResolver";
  * docs' regeneration plan, which rotted every time a file was renamed).
  *
  * `generatePointersInSubfolders(plugin, folder, extensions?, granularity?)`
- * writes one `pointers.md` into each immediate subfolder of `folder` (see
- * pointerConsumers.ts), overwriting whatever is there. File granularity
+ * writes one `pointers.md` into each eligible subfolder of `folder` down to
+ * `settings.pointerSubfolderDepth` levels (default 1 = immediate subfolders
+ * only; ignored folders are skipped at every level — see pointerConsumers.ts),
+ * overwriting whatever is there. File granularity
  * writes one `## {file}` section per code file in the subfolder; symbol
  * granularity writes one `## {file}#{symbol}` section per linkable symbol
  * into the same `pointers.md` instead. Each section lists every code file (file granularity) or
@@ -70,21 +72,42 @@ export interface PointerResult {
 	empty: string[];
 }
 
-/** Immediate subfolders eligible for pointer generation (skips output/dot/ignored dirs). */
+/** Subfolder predicate shared by the target walk (skips output/dot/ignored dirs). */
+function isPointerTargetFolder(
+	child: TFolder,
+	includeGenerated: boolean,
+	ignoredFolders: string[],
+): boolean {
+	if (child.name.startsWith(".")) return false;
+	if (SKIP_DIR_NAMES.has(child.name)) return false;
+	if (!includeGenerated && GENERATED_DIR_NAMES.has(child.name)) return false;
+	if (isIgnoredFolderPath(child.path, ignoredFolders)) return false;
+	return true;
+}
+
+/**
+ * Subfolders eligible for pointer generation: the immediate subfolders of
+ * `folder` (skips output/dot/ignored dirs), plus their subfolders when
+ * `maxDepth` > 1 — one `pointers.md` per eligible folder down to that many
+ * levels. Ignored folders are skipped at every level and never descended
+ * into, so nothing under them is ever written.
+ */
 export function pointerTargetFolders(
 	folder: TFolder,
 	includeGenerated: boolean,
 	ignoredFolders: string[] = [],
+	maxDepth = 1,
 ): TFolder[] {
 	const out: TFolder[] = [];
-	for (const child of folder.children) {
-		if (!(child instanceof TFolder)) continue;
-		if (child.name.startsWith(".")) continue;
-		if (SKIP_DIR_NAMES.has(child.name)) continue;
-		if (!includeGenerated && GENERATED_DIR_NAMES.has(child.name)) continue;
-		if (isIgnoredFolderPath(child.path, ignoredFolders)) continue;
-		out.push(child);
-	}
+	const walk = (dir: TFolder, depth: number): void => {
+		for (const child of dir.children) {
+			if (!(child instanceof TFolder)) continue;
+			if (!isPointerTargetFolder(child, includeGenerated, ignoredFolders)) continue;
+			out.push(child);
+			if (depth < maxDepth) walk(child, depth + 1);
+		}
+	};
+	walk(folder, 1);
 	out.sort((a, b) => a.path.localeCompare(b.path));
 	return out;
 }
@@ -385,11 +408,20 @@ function emitSymbolConsumerLines(
 	}
 }
 
+/** Settings value → usable subfolder depth (integer, 1..16; invalid/absent = 1). */
+export function normalizePointerDepth(value: unknown): number {
+	const n = typeof value === "number" ? value : Number(value);
+	if (!Number.isFinite(n) || n < 1) return 1;
+	return Math.min(Math.floor(n), 16);
+}
+
 /**
- * Writes pointer files into each immediate subfolder of `folder` (or into
- * `folder` itself when it has no eligible subfolders, so the command also
- * works on a single module folder). Consumer detection builds one flowchart
- * model rooted at the vault root and shares it across all targets.
+ * Writes pointer files into each eligible subfolder of `folder` down to
+ * `settings.pointerSubfolderDepth` levels (default 1 = immediate subfolders),
+ * or into `folder` itself when it has no eligible subfolders, so the command
+ * also works on a single module folder. Ignored folders are skipped at every
+ * level. Consumer detection builds one flowchart model rooted at the vault
+ * root and shares it across all targets.
  * Serialized by the caller via `runExclusive` — vault writes must not
  * overlap.
  *
@@ -407,7 +439,8 @@ export async function generatePointersInSubfolders(
 	const exts = [...new Set([...(extensions ?? plugin.settings.extensions), "tscn"])];
 	const includeGenerated = plugin.settings.includeGeneratedCodeFiles;
 	const ignoredFolders = parseIgnorePatterns(plugin.settings.ignoredFolders);
-	let targets = pointerTargetFolders(folder, includeGenerated, ignoredFolders);
+	const depth = normalizePointerDepth(plugin.settings.pointerSubfolderDepth);
+	let targets = pointerTargetFolders(folder, includeGenerated, ignoredFolders, depth);
 	if (targets.length === 0) targets = [folder];
 	// One vault-wide model: consumers can live anywhere in the vault, and the
 	// reducer/accessor indexes need every rs file in scope to resolve.

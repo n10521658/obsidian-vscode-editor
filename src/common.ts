@@ -31,6 +31,14 @@ export interface EditorSettings {
 	 * See folderIgnore.ts for the matching rules.
 	 */
 	ignoredFolders: string[];
+	/**
+	 * How many levels of subfolders "Generate pointers in subfolders" writes a
+	 * `pointers.md` into: 1 = the command folder's immediate subfolders only
+	 * (default), 2 = those plus their subfolders, and so on. Ignored folders
+	 * (see `ignoredFolders`) are skipped at every level and never descended
+	 * into. 0 is treated as 1.
+	 */
+	pointerSubfolderDepth: number;
 }
 
 export const DEFAULT_SETTINGS: EditorSettings = {
@@ -55,6 +63,7 @@ export const DEFAULT_SETTINGS: EditorSettings = {
 	pruneStaleFlowcharts: true,
 	pruneToSystemTrash: false,
 	ignoredFolders: [],
+	pointerSubfolderDepth: 1,
 }
 
 

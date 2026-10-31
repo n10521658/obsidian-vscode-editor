@@ -26,6 +26,7 @@ import {
 	PointerGranularity,
 	PointerResult,
 	generatePointersInSubfolders,
+	normalizePointerDepth,
 	pointerTargetFolders,
 } from "./pointerFiles";
 import {
@@ -67,7 +68,8 @@ import { isIgnoredFolderPath, parseIgnorePatterns } from "./folderIgnore";
  *                   folder's own canvases only)
   *   any code folder ▸ "Generate pointers in subfolders" ▸ File granularity
   *                 / Symbol granularity — writes one generated `pointers.md`
-  *                 into each immediate subfolder (file: one `## {file}`
+  *                 into each eligible subfolder down to
+  *                 "Pointer subfolder depth" levels (file: one `## {file}`
   *                 section per code file; symbol: one `## {file}#{symbol}`
   *                 section per linkable symbol, overwriting the same file)
   *                 with its consumer entries directly underneath; see
@@ -606,12 +608,14 @@ function addRegenerateMenuItem(
 /**
  * Folder context-menu item behind the generated pointer files (see
  * pointerFiles.ts): "Generate pointers in subfolders" ▸ File granularity /
- * Symbol granularity — writes one `pointers.md` into each immediate
- * subfolder (file granularity: one `## {file}` section per code file;
+ * Symbol granularity — writes one `pointers.md` into each eligible subfolder
+ * down to `settings.pointerSubfolderDepth` levels (default: immediate
+ * subfolders only; file granularity: one `## {file}` section per code file;
  * symbol granularity: one `## {file}#{symbol}` section per linkable
  * symbol, overwriting the same file), indexing its code and annotated
  * vault-wide consumers. Offered on any folder that has eligible subfolders
  * (or code files, so it also works on a single leaf module folder).
+ * Ignored folders are skipped at every level.
  */
 function addPointerMenuItem(
 	plugin: CodeFilesPlugin,
@@ -621,7 +625,8 @@ function addPointerMenuItem(
 ): void {
 	const includeGenerated = plugin.settings.includeGeneratedCodeFiles;
 	const ignoredFolders = parseIgnorePatterns(plugin.settings.ignoredFolders);
-	const targets = pointerTargetFolders(folder, includeGenerated, ignoredFolders);
+	const depth = normalizePointerDepth(plugin.settings.pointerSubfolderDepth);
+	const targets = pointerTargetFolders(folder, includeGenerated, ignoredFolders, depth);
 	if (targets.length === 0) {
 		if (countByExtension(folder, plugin.settings.extensions, includeGenerated, ignoredFolders).size === 0) return;
 	}

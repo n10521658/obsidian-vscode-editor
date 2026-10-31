@@ -2,6 +2,7 @@ import { App, PluginSettingTab, Setting } from "obsidian";
 import CodeFilesPlugin from "./main";
 import { SymbolKind } from "./symbolResolver";
 import { parseIgnorePatterns } from "./folderIgnore";
+import { normalizePointerDepth } from "./pointerFiles";
 import { t } from 'src/lang/helpers';
 
 
@@ -213,6 +214,26 @@ export class CodeFilesSettingsTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}))
 			.setClass("setting_ext");
+
+		new Setting(containerEl)
+			.setName('Pointer subfolder depth')
+			.setDesc(
+				'How many levels of subfolders "Generate pointers in subfolders" writes a `pointers.md` into. ' +
+				'1 = the command folder\'s immediate subfolders only (default); 2 = those plus their subfolders; and so on, ' +
+				'up to 16. Ignored folders (above) are skipped at every level and never descended into.',
+			)
+			.addText(text => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "16";
+				text.setValue(normalizePointerDepth(this.plugin.settings.pointerSubfolderDepth).toString())
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						if (!Number.isFinite(parsed) || parsed < 1) return;
+						this.plugin.settings.pointerSubfolderDepth = normalizePointerDepth(parsed);
+						await this.plugin.saveSettings();
+					});
+			});
 
 		containerEl.createEl('h2', { text: 'Flowcharts' });
 
